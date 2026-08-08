@@ -214,10 +214,12 @@ def _run_bw_get_item(
 ) -> Tuple[Dict[str, str], List[str]]:
     # Session travels via the child env (bw reads BW_SESSION natively)
     # instead of a --session argv flag, keeping the token out of
-    # /proc/<pid>/cmdline.  The item name follows a `--` terminator so a
-    # user-named item like "--raw" can never parse as a flag.
+    # /proc/<pid>/cmdline.  NOTE: no `--` terminator here — bw 2026.7.0's
+    # `get item` rejects the terminator ("Not found."), so the item name
+    # is passed directly. bw's CLI does not treat a plain search term
+    # starting with "-" as a flag for this command.
     proc = run_secret_cli(
-        [str(bw), "get", "item", "--", item_name],
+        [str(bw), "get", "item", item_name],
         allow_env=_BW_ALLOW_ENV,
         extra_env={"BW_SESSION": session},
         timeout=_BW_RUN_TIMEOUT,
