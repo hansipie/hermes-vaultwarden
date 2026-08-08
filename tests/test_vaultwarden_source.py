@@ -194,7 +194,8 @@ class TestFetchVaultwardenSecrets:
         argv = mock_run.call_args.args[0]
         assert "--session" not in argv
         assert _FAKE_SESSION not in argv
-        assert argv[-2:] == ["--", "Hermes"]
+        assert argv[-1] == "Hermes"
+        assert "--" not in argv
         child_env = mock_run.call_args.kwargs["env"]
         assert child_env["BW_SESSION"] == _FAKE_SESSION
         # allowlisted env only — no wholesale os.environ copy
