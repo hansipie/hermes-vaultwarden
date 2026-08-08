@@ -558,6 +558,131 @@ def test_classify_bw_error(message, expected):
 
 
 # ---------------------------------------------------------------------------
+# mint_session — B2 auto-unlock: mint a session in memory from bot account
+# ---------------------------------------------------------------------------
+
+
+class TestMintSession:
+    def test_missing_env_raises(self, monkeypatch):
+        monkeypatch.delenv("BW_USERNAME", raising=False)
+        monkeypatch.delenv("BW_MASTER_PASSWORD", raising=False)
+        with pytest.raises(RuntimeError, match="auto_unlock requires"):
+            vw.mint_session(Path("/usr/bin/bw"))
+
+    def test_login_produces_session_without_password_in_argv(self, monkeypatch):
+        monkeypatch.setenv("BW_USERNAME", "hermes-bot@example.com")
+        monkeypatch.setenv("BW_MASTER_PASSWORD", "master-secret")
+        monkeypatch.setenv("VAULTWARDEN_URL", "https://vault.example.com")
+
+        login_proc = mock.MagicMock()
+        login_proc.returncode = 0
+        login_proc.stdout = "fresh-session-token\n"
+        login_proc.stderr = ""
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[_make_ok_proc(), login_proc],
+        ) as mock_run:
+            session = vw.mint_session(Path("/usr/bin/bw"))
+
+        assert session == "fresh-session-token"
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0][:4] == ["/usr/bin/bw", "config", "server", "https://vault.example.com"]
+        assert calls[1][:5] == [
+            "/usr/bin/bw", "login", "hermes-bot@example.com", "--passwordenv", "BW_MASTER_PASSWORD"
+        ]
+        assert "master-secret" not in calls[1]
+        child_env = mock_run.call_args_list[1].kwargs["env"]
+        assert child_env["BW_MASTER_PASSWORD"] == "master-secret"
+
+    def test_login_failure_raises(self, monkeypatch):
+        monkeypatch.setenv("BW_USERNAME", "hermes-bot@example.com")
+        monkeypatch.setenv("BW_MASTER_PASSWORD", "master-secret")
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                _make_ok_proc(),
+                _make_fail_proc(1, "Invalid master password"),
+            ],
+        ):
+            with pytest.raises(RuntimeError, match="bw login failed"):
+                vw.mint_session(Path("/usr/bin/bw"))
+
+    def test_empty_login_output_raises(self, monkeypatch):
+        monkeypatch.setenv("BW_USERNAME", "hermes-bot@example.com")
+        monkeypatch.setenv("BW_MASTER_PASSWORD", "master-secret")
+        empty_proc = mock.MagicMock()
+        empty_proc.returncode = 0
+        empty_proc.stdout = ""
+        empty_proc.stderr = ""
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[_make_ok_proc(), empty_proc],
+        ):
+            with pytest.raises(RuntimeError, match="empty session token"):
+                vw.mint_session(Path("/usr/bin/bw"))
+
+
+class TestVaultwardenSourceAutoUnlock:
+    def setup_method(self):
+        vw._CACHE.clear()
+        self.source = vw.VaultwardenSource()
+
+    def test_auto_unlock_mints_session_and_fetches(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BW_SESSION", raising=False)
+        monkeypatch.setenv("BW_USERNAME", "hermes-bot@example.com")
+        monkeypatch.setenv("BW_MASTER_PASSWORD", "master-secret")
+        monkeypatch.setenv("VAULTWARDEN_URL", "https://vault.example.com")
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+
+        login_proc = mock.MagicMock()
+        login_proc.returncode = 0
+        login_proc.stdout = "auto-minted-session\n"
+        login_proc.stderr = ""
+
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                _make_ok_proc(),       # config server
+                login_proc,             # login --passwordenv
+                _make_ok_proc(),       # get item
+            ],
+        ) as mock_run:
+            result = self.source.fetch(
+                {"enabled": True, "item_name": "Hermes", "auto_unlock": True},
+                tmp_path,
+            )
+
+        assert result.ok
+        assert result.secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        argv_text = " ".join(" ".join(c.args[0]) for c in mock_run.call_args_list)
+        assert "auto-minted-session" not in argv_text
+        assert "master-secret" not in argv_text
+        get_item_env = mock_run.call_args_list[2].kwargs["env"]
+        assert get_item_env["BW_SESSION"] == "auto-minted-session"
+
+    def test_auto_unlock_disabled_still_requires_session(self, monkeypatch):
+        monkeypatch.delenv("BW_SESSION", raising=False)
+        result = self.source.fetch(
+            {"enabled": True, "item_name": "Hermes"}, Path("/tmp")
+        )
+        assert not result.ok
+        assert result.error_kind is ErrorKind.NOT_CONFIGURED
+        assert "auto_unlock" in result.error
+
+    def test_auto_unlock_missing_bootstrap_env_reports_clean_error(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BW_SESSION", raising=False)
+        monkeypatch.delenv("BW_USERNAME", raising=False)
+        monkeypatch.delenv("BW_MASTER_PASSWORD", raising=False)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        result = self.source.fetch(
+            {"enabled": True, "item_name": "Hermes", "auto_unlock": True},
+            tmp_path,
+        )
+        assert not result.ok
+        assert "auto_unlock requires" in result.error
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator round-trip — apply semantics now live in registry.apply_all
 # ---------------------------------------------------------------------------
 

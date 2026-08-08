@@ -133,6 +133,67 @@ def _session_fingerprint(session: str) -> str:
     return hashlib.sha256(session.encode("utf-8")).hexdigest()[:16]
 
 
+def mint_session(
+    binary: Path,
+    *,
+    username_env: str = "BW_USERNAME",
+    master_password_env: str = "BW_MASTER_PASSWORD",
+    server_url_env: str = "VAULTWARDEN_URL",
+    allow_env: Tuple[str, ...] = (),
+) -> str:
+    """Mint a fresh ``bw`` session token in memory (auto-unlock mode).
+
+    Runs ``bw config server`` and ``bw login <username> --passwordenv
+    <MASTER_PASSWORD_ENV> --raw`` using the machine account credentials from
+    the process environment (Coolify-injected bootstrap vars). The master
+    password travels via the child environment (``--passwordenv``) — never
+    argv. The returned token lives ONLY in the caller's memory — it is never
+    written to disk, ``.env`` or any config file.
+
+    Note: the ``bw`` CLI refuses organization API keys
+    (``bw login --apikey``; bitwarden/clients#11965) and requires the master
+    password to unlock anyway, so the machine identity is a dedicated 2FA-less
+    bot account (``BW_USERNAME``) with a strong master password
+    (``BW_MASTER_PASSWORD``).
+
+    Raises :class:`RuntimeError` on any failure (missing env, login or
+    unlock rejection) — callers map it onto the ErrorKind taxonomy.
+    """
+    username = os.environ.get(username_env, "").strip()
+    master_password = os.environ.get(master_password_env, "").strip()
+    server_url = os.environ.get(server_url_env, "").strip()
+    if not username or not master_password:
+        raise RuntimeError(
+            f"auto_unlock requires {username_env} and {master_password_env} "
+            "in the process environment (Coolify env)"
+        )
+
+    if server_url:
+        proc = run_secret_cli(
+            [str(binary), "config", "server", server_url],
+            allow_env=allow_env,
+            timeout=_BW_RUN_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+            raise RuntimeError(f"bw config server failed: {err[:200]}")
+
+    proc = run_secret_cli(
+        [str(binary), "login", username, "--passwordenv", master_password_env, "--raw"],
+        allow_env=allow_env,
+        extra_env={master_password_env: master_password},
+        timeout=_BW_RUN_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+        raise RuntimeError(f"bw login failed: {err[:200]}")
+
+    session = (proc.stdout or "").strip()
+    if not session:
+        raise RuntimeError("bw login --raw returned an empty session token")
+    return session
+
+
 def fetch_vaultwarden_secrets(
     *,
     session: str,
@@ -371,8 +432,29 @@ class VaultwardenSource(SecretSource):
         return {
             "enabled": {"description": "Master switch", "default": False},
             "session_env": {
-                "description": "Env var holding the `bw unlock --raw` session token",
+                "description": "Env var holding the `bw` session token",
                 "default": _DEFAULT_SESSION_ENV,
+            },
+            "auto_unlock": {
+                "description": (
+                    "When true and no session token is present in session_env, "
+                    "mint one in memory via `bw login <username> --passwordenv ...` "
+                    "using BW_USERNAME / BW_MASTER_PASSWORD / VAULTWARDEN_URL from "
+                    "the process environment. The token is never persisted."
+                ),
+                "default": False,
+            },
+            "username_login_env": {
+                "description": "Env var holding the bot username for auto_unlock",
+                "default": "BW_USERNAME",
+            },
+            "master_password_env": {
+                "description": "Env var holding the bot master password for auto_unlock",
+                "default": "BW_MASTER_PASSWORD",
+            },
+            "server_url_env": {
+                "description": "Env var holding the vault URL for auto_unlock",
+                "default": "VAULTWARDEN_URL",
             },
             "item_name": {
                 "description": "Vault item whose custom fields become env vars",
@@ -423,12 +505,38 @@ class VaultwardenSource(SecretSource):
 
         session_env = str(cfg.get("session_env") or _DEFAULT_SESSION_ENV)
         session = os.environ.get(session_env, "").strip()
+
+        auto_unlock = bool(cfg.get("auto_unlock", False))
+        if not session and auto_unlock:
+            # B2: mint a session in memory from the bot account credentials
+            # (Coolify-injected bootstrap vars). Never persisted.
+            binary0 = find_bw(cfg.get("binary_path"))
+            if binary0 is None:
+                result.error = (
+                    "bw binary not found.  Install it from your package manager or "
+                    "https://github.com/bitwarden/clients/releases"
+                )
+                result.error_kind = ErrorKind.BINARY_MISSING
+                return result
+            try:
+                session = mint_session(
+                    binary0,
+                    username_env=str(cfg.get("username_login_env") or "BW_USERNAME"),
+                    master_password_env=str(cfg.get("master_password_env") or "BW_MASTER_PASSWORD"),
+                    server_url_env=str(cfg.get("server_url_env") or "VAULTWARDEN_URL"),
+                )
+                result.warnings.append("auto_unlock: minted a fresh session (never persisted)")
+            except RuntimeError as exc:
+                result.error = str(exc)
+                result.error_kind = _classify_bw_error(str(exc))
+                return result
+
         if not session:
             result.error = (
                 f"secrets.vaultwarden.enabled is true but {session_env} is not "
-                "set.  Run `bw unlock --raw` and store the output in your .env "
-                f"file as {session_env}=<token>, or run "
-                "`hermes vaultwarden setup`."
+                "set. Run `hermes vaultwarden setup`, or set "
+                "secrets.vaultwarden.auto_unlock=true to mint a session from "
+                "BW_USERNAME / BW_MASTER_PASSWORD in the process environment."
             )
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
