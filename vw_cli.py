@@ -5,9 +5,10 @@ lives here so :meth:`vw_source.VaultwardenSource.fetch` can stay strictly
 non-interactive.
 
 Subcommands:
-    setup    — interactive wizard: verify bw, store session token, pick item, test fetch
+    setup    — configure interactive-session or unattended API-key authentication
     status   — show current config + binary version + session presence
     sync     — run a fetch right now and show what would be applied (dry-run friendly)
+    reset-auth — log out the profile-isolated bw CLI state
     disable  — flip ``secrets.vaultwarden.enabled`` to False
 """
 
@@ -20,18 +21,12 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from agent.secret_sources.base import is_valid_env_name, run_secret_cli
+from hermes_cli.config import load_config, save_config
+from hermes_constants import get_hermes_home
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-
-from agent.secret_sources.base import is_valid_env_name, run_secret_cli
-from hermes_cli.config import (
-    get_env_path,
-    load_config,
-    save_config,
-    save_env_value,
-)
-from hermes_cli.secret_prompt import masked_secret_prompt
 
 try:
     from . import vw_source as vw
@@ -51,19 +46,22 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
 
     setup = sub.add_parser(
         "setup",
-        help="Interactive wizard: verify bw, store session token, pick item",
+        help="Configure Vaultwarden authentication and select a vault item",
     )
     setup.add_argument(
         "--item-name",
         help="Vault item name to read secrets from (skips interactive prompt)",
     )
     setup.add_argument(
-        "--session",
-        help=(
-            "Provide the BW_SESSION token non-interactively "
-            "(will be stored in .env)"
-        ),
+        "--binary-path",
+        help="Exact standalone bw binary path (recommended for sandboxed desktops)",
     )
+    setup.add_argument(
+        "--auto-unlock",
+        action="store_true",
+        help="Use BW_CLIENTID/BW_CLIENTSECRET/BW_MASTER_PASSWORD at startup",
+    )
+    setup.add_argument("--item-id", help="Immutable vault item ID (preferred)")
     setup.add_argument(
         "--server-url",
         help=(
@@ -97,6 +95,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
     )
     sync.set_defaults(func=cmd_sync)
 
+    reset_auth = sub.add_parser(
+        "reset-auth", help="Log out this Hermes profile's isolated bw state"
+    )
+    reset_auth.set_defaults(func=cmd_reset_auth)
+
     disable = sub.add_parser("disable", help="Turn off the Vaultwarden integration")
     disable.set_defaults(func=cmd_disable)
 
@@ -117,9 +120,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
             "  Native x64 binary:  https://bitwarden.com/help/cli/\n"
             "    → chmod +x bw && mv bw ~/.local/bin/\n"
             "    → ARM64 users: use npm instead of the native binary\n\n"
-            "Then:\n"
-            "  2. Log in:   [cyan]bw login[/cyan]\n"
-            "  3. Unlock:   [cyan]export BW_SESSION=$(bw unlock --raw)[/cyan]\n\n"
+            "For interactive use, export a session from [cyan]bw unlock --raw[/cyan].\n"
+            "For unattended use, provide a personal API key and master password as\n"
+            "[cyan]BW_CLIENTID[/cyan], [cyan]BW_CLIENTSECRET[/cyan], and "
+            "[cyan]BW_MASTER_PASSWORD[/cyan].\n\n"
             "Secrets are read from a vault item's [bold]custom fields[/bold].  "
             "Name each field after the env var it should set "
             "(e.g. [cyan]OPENROUTER_API_KEY[/cyan]).",
@@ -130,7 +134,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ binary
     console.print()
     console.print("[bold]Step 1[/bold]  Locate the bw CLI")
-    binary = vw.find_bw()
+    binary = vw.find_bw(args.binary_path)
     if binary is None:
         console.print(
             "  [red]bw not found on PATH or in <hermes_home>/bin.[/red]\n\n"
@@ -149,41 +153,26 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # -- non-interactive guard --
     if not sys.stdin.isatty():
         missing = []
-        if not (args.session and args.session.strip()):
-            if not os.environ.get("BW_SESSION", "").strip():
-                missing.append("--session")
-        if not (args.item_name and args.item_name.strip()):
-            missing.append("--item-name")
+        if not args.auto_unlock and not os.environ.get("BW_SESSION", "").strip():
+            missing.append("BW_SESSION or --auto-unlock")
+        if args.auto_unlock and not (args.server_url and args.server_url.strip()):
+            missing.append("--server-url")
+        if not ((args.item_id and args.item_id.strip()) or (args.item_name and args.item_name.strip())):
+            missing.append("--item-id or --item-name")
         if missing:
             console.print(
                 f"  [red]Non-interactive mode (no TTY) requires all setup flags.[/red]\n"
                 f"  Missing: {', '.join(missing)}\n\n"
                 "  Usage:\n"
-                "    hermes vaultwarden setup \\\n"
-                "      --session '<bw-session-token>' \\\n"
-                "      --item-name 'Hermes'"
+                "    hermes vaultwarden setup --auto-unlock \\\n"
+                "      --server-url https://vault.example.com \\\n"
+                "      --item-id '<vault-item-id>'"
             )
             return 1
 
     # ------------------------------------------------------------------ server
-    if args.server_url and args.server_url.strip():
-        console.print()
-        console.print("[bold]Step 2[/bold]  Configure server URL")
-        server_url = args.server_url.strip()
-        try:
-            res = run_secret_cli(
-                [str(binary), "config", "server", "--", server_url],
-                timeout=10,
-            )
-        except RuntimeError as exc:
-            console.print(f"  [red]Could not configure server: {exc}[/red]")
-            return 1
-        if res.returncode != 0:
-            err = (res.stderr or res.stdout).strip()[:200]
-            console.print(f"  [red]bw config server failed: {err}[/red]")
-            return 1
-        console.print(f"  [green]✓[/green] Server set to {server_url}")
-    else:
+    server_url = (args.server_url or "").strip()
+    if not server_url and not args.auto_unlock:
         current_server = _bw_current_server(binary)
         if current_server:
             console.print(
@@ -193,37 +182,48 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # ------------------------------------------------------------------ session
     console.print()
-    console.print("[bold]Step 3[/bold]  Provide the BW_SESSION token")
+    console.print("[bold]Step 3[/bold]  Authenticate")
     cfg = load_config()
     secrets_cfg = (cfg.setdefault("secrets", {})
                      .setdefault("vaultwarden", {}))
     session_env = secrets_cfg.get("session_env", "BW_SESSION")
 
-    session = (args.session or "").strip() or os.environ.get(session_env, "").strip()
-    if not session:
+    session = os.environ.get(session_env, "").strip()
+    appdata_dir = None
+    if args.auto_unlock:
+        try:
+            session = vw.mint_session(
+                binary,
+                home_path=get_hermes_home(),
+                server_url=server_url,
+            )
+            appdata_dir = vw._profile_bw_appdata(get_hermes_home())
+        except RuntimeError as exc:
+            console.print(f"  [red]Unattended authentication failed: {exc}[/red]")
+            return 1
+        console.print("  [green]✓[/green] API-key login and in-memory unlock succeeded")
+    elif session:
+        console.print(f"  [green]✓[/green] using {session_env} from the process environment")
+    else:
         console.print(
-            "  Obtain it with: [cyan]export BW_SESSION=$(bw unlock --raw)[/cyan]"
+            f"  [red]{session_env} is not set.[/red] Export the output of "
+            "[cyan]bw unlock --raw[/cyan], or re-run with [cyan]--auto-unlock[/cyan]."
         )
-        session = masked_secret_prompt(
-            f"  Paste session token ({session_env}): "
-        ).strip()
-    if not session:
-        console.print("  [red]Empty session token, aborting.[/red]")
         return 1
-
-    save_env_value(session_env, session)
-    os.environ[session_env] = session
-    console.print(f"  [green]✓[/green] stored in {get_env_path()} as {session_env}")
 
     # ------------------------------------------------------------------ item
     console.print()
     console.print("[bold]Step 4[/bold]  Pick a vault item")
 
-    if args.item_name and args.item_name.strip():
+    item_id = (args.item_id or "").strip()
+    if item_id:
+        item_name = item_id
+        console.print(f"  Using item ID: [cyan]{item_id}[/cyan]")
+    elif args.item_name and args.item_name.strip():
         item_name = args.item_name.strip()
         console.print(f"  Using item: [cyan]{item_name}[/cyan]")
     else:
-        items = _list_items(binary, session, console)
+        items = _list_items(binary, session, console, appdata_dir=appdata_dir)
         if items is None:
             return 1
         if not items:
@@ -251,7 +251,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 console.print("  [red]Enter a number.[/red]")
                 continue
             if 1 <= idx <= len(items):
-                item_name = items[idx - 1]["name"]
+                item_id = items[idx - 1]["id"]
+                item_name = item_id
                 break
             console.print(f"  [red]Out of range — pick 1-{len(items)}.[/red]")
 
@@ -308,6 +309,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             username_env=username_env,
             password_env=password_env,
             notes_env=notes_env,
+            appdata_dir=appdata_dir,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
@@ -337,10 +339,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # ------------------------------------------------------------------ save
     secrets_cfg["enabled"] = True
-    secrets_cfg["item_name"] = item_name
+    if item_id:
+        secrets_cfg["item_id"] = item_id
+        secrets_cfg.pop("item_name", None)
+    else:
+        secrets_cfg["item_name"] = item_name
+    secrets_cfg["auto_unlock"] = bool(args.auto_unlock)
+    if server_url:
+        secrets_cfg["server_url"] = server_url
     secrets_cfg.setdefault("session_env", session_env)
-    secrets_cfg.setdefault("cache_ttl_seconds", 300)
-    secrets_cfg.setdefault("override_existing", True)
+    secrets_cfg.setdefault("cache_ttl_seconds", 0)
+    secrets_cfg.setdefault("override_existing", False)
+    if args.binary_path:
+        secrets_cfg["binary_path"] = str(binary)
 
     for key, value in (
         ("username_env", username_env),
@@ -370,14 +381,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         "  Status:  [cyan]hermes vaultwarden status[/cyan]\n"
         "  Refresh: [cyan]hermes vaultwarden sync[/cyan]\n"
         "  Disable: [cyan]hermes vaultwarden disable[/cyan]\n\n"
-        "  [yellow]Note:[/yellow] plugin secret sources are consulted by every "
-        "Hermes process spawned [italic]after[/italic] plugin discovery — the very "
-        "first process of a fresh invocation loads its env before plugins are "
-        "discovered.  Use [cyan]hermes vaultwarden sync --apply[/cyan] (or .env) "
-        "for secrets the first process itself needs.\n"
-        "  [yellow]Note:[/yellow] the BW_SESSION token expires when your vault locks.\n"
-        "  Re-unlock with [cyan]export BW_SESSION=$(bw unlock --raw)[/cyan] and "
-        "update .env when that happens."
+        "  Auto-unlock sessions are minted in memory for each Hermes process and "
+        "are never written to config or .env."
     )
     return 0
 
@@ -388,8 +393,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     vw_cfg = (cfg.get("secrets") or {}).get("vaultwarden") or {}
 
     enabled = bool(vw_cfg.get("enabled"))
+    auto_unlock = bool(vw_cfg.get("auto_unlock"))
     session_env = vw_cfg.get("session_env", "BW_SESSION")
-    item_name = vw_cfg.get("item_name", "")
+    item_name = vw_cfg.get("item_id") or vw_cfg.get("item_name", "")
     session_set = bool(os.environ.get(session_env))
     plugin_enabled = "vaultwarden" in (
         (cfg.get("plugins") or {}).get("enabled") or []
@@ -403,17 +409,28 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_column("")
     table.add_row("Plugin enabled",   _yn(plugin_enabled))
     table.add_row("Source enabled",   _yn(enabled))
+    table.add_row("Auth mode",        "API key + auto-unlock" if auto_unlock else "session env")
     table.add_row("session_env",      session_env)
-    table.add_row("session",          "[green]present[/green]" if session_set else "[red]missing[/red]")
+    table.add_row("session",          "[green]present[/green]" if session_set else "[dim]not supplied[/dim]")
     table.add_row("item",             item_name or "[dim](unset)[/dim]")
     table.add_row("username_env",     login_bindings["username_env"] or "[dim](unset)[/dim]")
     table.add_row("password_env",     login_bindings["password_env"] or "[dim](unset)[/dim]")
     table.add_row("notes_env",        login_bindings["notes_env"] or "[dim](unset)[/dim]")
     table.add_row("Override existing", _yn(bool(vw_cfg.get("override_existing", False))))
-    table.add_row("Cache TTL (s)",    str(vw_cfg.get("cache_ttl_seconds", 300)))
+    table.add_row("Cache TTL (s)",    str(vw_cfg.get("cache_ttl_seconds", 0)))
+
+    if auto_unlock:
+        for key, default in (
+            ("client_id_env", "BW_CLIENTID"),
+            ("client_secret_env", "BW_CLIENTSECRET"),
+            ("master_password_env", "BW_MASTER_PASSWORD"),
+        ):
+            env_name = str(vw_cfg.get(key) or default)
+            table.add_row(env_name, "[green]present[/green]" if os.environ.get(env_name) else "[red]missing[/red]")
 
     if binary:
-        server = _bw_current_server(binary)
+        appdata_dir = vw._profile_bw_appdata(get_hermes_home()) if auto_unlock else None
+        server = _bw_current_server(binary, appdata_dir=appdata_dir)
         table.add_row("bw binary",   f"{binary} ({_bw_version(binary)})")
         table.add_row("bw server",   server or "[dim]default (bitwarden.com)[/dim]")
     else:
@@ -431,7 +448,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     elif not enabled:
         console.print("\n  Run [cyan]hermes vaultwarden setup[/cyan] to enable.")
-    elif not session_set:
+    elif not session_set and not auto_unlock:
         console.print(
             f"\n  [yellow]Enabled but {session_env} is not set — Hermes will skip "
             "Vaultwarden and warn on next startup.[/yellow]\n"
@@ -454,12 +471,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return 1
 
     session_env = vw_cfg.get("session_env", "BW_SESSION")
-    session = os.environ.get(session_env, "").strip()
-    if not session:
-        console.print(f"[red]{session_env} is not set.[/red]")
-        return 1
 
-    item_name = vw_cfg.get("item_name", "")
+    item_name = vw_cfg.get("item_id") or vw_cfg.get("item_name", "")
     if not item_name:
         console.print("[red]No item_name configured.[/red]")
         return 1
@@ -471,12 +484,35 @@ def cmd_sync(args: argparse.Namespace) -> int:
         console.print("[red]bw binary not found.[/red]")
         return 1
 
+    session = os.environ.get(session_env, "").strip()
+    appdata_dir = None
+    if not session and vw_cfg.get("auto_unlock"):
+        try:
+            session = vw.mint_session(
+                binary,
+                home_path=get_hermes_home(),
+                client_id_env=str(vw_cfg.get("client_id_env") or "BW_CLIENTID"),
+                client_secret_env=str(vw_cfg.get("client_secret_env") or "BW_CLIENTSECRET"),
+                master_password_env=str(vw_cfg.get("master_password_env") or "BW_MASTER_PASSWORD"),
+                server_url=str(vw_cfg.get("server_url") or ""),
+            )
+            appdata_dir = vw._profile_bw_appdata(get_hermes_home())
+        except RuntimeError as exc:
+            console.print(f"[red]Authentication failed: {exc}[/red]")
+            return 1
+    if not session:
+        console.print(f"[red]{session_env} is not set.[/red]")
+        return 1
+
     console.print("[dim]Syncing vault from server…[/dim]")
     try:
+        child_env = {"BW_SESSION": session}
+        if appdata_dir is not None:
+            child_env["BITWARDENCLI_APPDATA_DIR"] = str(appdata_dir)
         res = run_secret_cli(
             [str(binary), "sync"],
             allow_env=vw._BW_ALLOW_ENV,
-            extra_env={"BW_SESSION": session},
+            extra_env=child_env,
             timeout=30,
         )
         if res.returncode != 0:
@@ -494,6 +530,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             username_env=login_bindings["username_env"],
             password_env=login_bindings["password_env"],
             notes_env=login_bindings["notes_env"],
+            appdata_dir=appdata_dir,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Fetch failed: {exc}[/red]")
@@ -556,6 +593,30 @@ def cmd_disable(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reset_auth(args: argparse.Namespace) -> int:
+    """Log out only the ``bw`` state owned by the active Hermes profile."""
+    console = Console()
+    cfg = load_config()
+    vw_cfg = (cfg.get("secrets") or {}).get("vaultwarden") or {}
+    binary = vw.find_bw(vw_cfg.get("binary_path"))
+    if binary is None:
+        console.print("[red]bw binary not found.[/red]")
+        return 1
+    appdata_dir = vw._profile_bw_appdata(get_hermes_home())
+    try:
+        res = vw._run_bw(binary, "logout", appdata_dir=appdata_dir)
+    except RuntimeError as exc:
+        console.print(f"[red]Could not reset profile authentication: {exc}[/red]")
+        return 1
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or "").strip()[:200]
+        if "not logged in" not in err.lower():
+            console.print(f"[red]bw logout failed: {err}[/red]")
+            return 1
+    console.print("[green]Profile authentication reset.[/green] No vault items were changed.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -575,10 +636,18 @@ def _bw_version(binary: Path) -> str:
     return "version unknown"
 
 
-def _bw_current_server(binary: Path) -> str:
+def _bw_current_server(binary: Path, appdata_dir: Optional[Path] = None) -> str:
     """Return the currently configured bw server URL, or empty string."""
     try:
-        res = run_secret_cli([str(binary), "config", "server"], timeout=5)
+        child_env = (
+            {"BITWARDENCLI_APPDATA_DIR": str(appdata_dir)} if appdata_dir else None
+        )
+        res = run_secret_cli(
+            [str(binary), "config", "server"],
+            allow_env=vw._BW_ALLOW_ENV,
+            extra_env=child_env,
+            timeout=5,
+        )
         if res.returncode == 0:
             return (res.stdout or "").strip()
     except RuntimeError:
@@ -587,14 +656,20 @@ def _bw_current_server(binary: Path) -> str:
 
 
 def _list_items(
-    binary: Path, session: str, console: Console
+    binary: Path,
+    session: str,
+    console: Console,
+    appdata_dir: Optional[Path] = None,
 ) -> Optional[List[dict]]:
     """Call ``bw list items`` and return items that have custom fields."""
     try:
+        child_env = {"BW_SESSION": session}
+        if appdata_dir is not None:
+            child_env["BITWARDENCLI_APPDATA_DIR"] = str(appdata_dir)
         res = run_secret_cli(
             [str(binary), "list", "items"],
             allow_env=vw._BW_ALLOW_ENV,
-            extra_env={"BW_SESSION": session},
+            extra_env=child_env,
             timeout=20,
         )
     except RuntimeError as exc:

@@ -16,10 +16,8 @@ reworked for the pluggable interface introduced in
 
 ## Install
 
-```bash
-git clone https://github.com/hansipie/hermes-vaultwarden ~/Code/hermes-vaultwarden
-ln -s ~/Code/hermes-vaultwarden ~/.hermes/plugins/vaultwarden
-```
+Clone the repository, then symlink or copy it to
+`$HERMES_HOME/plugins/vaultwarden`.
 
 User plugins are **opt-in** — add the plugin to `plugins.enabled` in
 `~/.hermes/config.yaml` (the setup wizard does this for you):
@@ -33,19 +31,58 @@ plugins:
 Install the `bw` CLI (not auto-installed): `npm install -g @bitwarden/cli`,
 snap, or the native binary from https://bitwarden.com/help/cli/.
 
-## Setup
+## Setup modes
+
+### Unattended services (recommended)
+
+Create a **personal API key** for the dedicated Bitwarden/Vaultwarden account.
+This is not a Bitwarden Secrets Manager organization access token. Supply the
+three bootstrap values to the Hermes process without writing them to
+`config.yaml`:
+
+```bash
+export BW_CLIENTID='user.…'
+export BW_CLIENTSECRET='…'
+export BW_MASTER_PASSWORD='…'
+hermes vaultwarden setup --auto-unlock \
+  --server-url https://your-vaultwarden.example.com \
+  --item-id '<vault-item-uuid>'
+```
+
+At startup the plugin checks the CLI state, logs in with `bw login --apikey`
+only when unauthenticated, and unlocks with `bw unlock --passwordenv … --raw`.
+The session token remains in process memory. Each Hermes profile gets isolated
+CLI state under `$HERMES_HOME/plugin-data/vaultwarden/bw-cli`, so profiles do
+not share login state.
+
+Unattended mode requires an explicit HTTPS `server_url` and verifies that the
+CLI persisted it before sending credentials. Sandboxed wrappers that cannot
+write the profile directory therefore fail closed; use Bitwarden's standalone
+CLI artifact or grant the wrapper access to `$HERMES_HOME`.
+Use `--binary-path /absolute/path/to/bw` to pin the standalone CLI when a
+desktop package also exposes a sandboxed `bw` wrapper on `PATH`.
+
+For system services, inject the three bootstrap variables with your service
+manager's secret/credential facility. Do not put values in unit files or
+`config.yaml`.
+
+If the Vaultwarden endpoint uses a private CA, set `NODE_EXTRA_CA_CERTS` to its
+PEM certificate path. The plugin passes only that standard trust-path variable
+to `bw`; it never disables TLS verification.
+
+### Interactive session
+
+Existing interactive behavior remains supported:
 
 ```bash
 bw config server https://your-vaultwarden.example.com
 bw login
 export BW_SESSION=$(bw unlock --raw)
-hermes vaultwarden setup
+hermes vaultwarden setup --item-id '<vault-item-uuid>'
 ```
 
-The wizard verifies `bw`, stores the session token in `~/.hermes/.env`,
-lets you pick the vault item, optionally maps `login.username` /
-`login.password` / `notes` to env vars, test-fetches it, and enables
-everything.
+The setup command reads `BW_SESSION` from its environment but never accepts a
+session on the command line and never persists it.
 
 Secrets are read from **one vault item's custom fields** — name each
 field after the env var it should set (e.g. `OPENROUTER_API_KEY`).
@@ -60,9 +97,10 @@ clears it from `config.yaml`.
 
 | Command | What it does |
 |---|---|
-| `hermes vaultwarden setup` | Interactive wizard (flags: `--session`, `--item-name`, `--server-url`, `--username-env`, `--password-env`, `--notes-env` for non-TTY) |
-| `hermes vaultwarden status` | Config, binary, server, session presence |
+| `hermes vaultwarden setup` | Configure authentication and select an item; `--item-id` is preferred |
+| `hermes vaultwarden status` | Config, binary, server, and bootstrap-variable presence (never values) |
 | `hermes vaultwarden sync` | `bw sync` + fresh fetch, dry-run table; `--apply` exports into the current process |
+| `hermes vaultwarden reset-auth` | Log out only this Hermes profile's isolated `bw` state |
 | `hermes vaultwarden disable` | Flips `secrets.vaultwarden.enabled` to false and clears the disk cache |
 
 ## Config (`secrets.vaultwarden.*` in config.yaml)
@@ -71,17 +109,23 @@ clears it from `config.yaml`.
 |---|---|---|
 | `enabled` | `false` | Master switch |
 | `session_env` | `BW_SESSION` | Env var holding the `bw unlock --raw` token |
+| `auto_unlock` | `false` | Mint a memory-only session from personal API-key credentials |
+| `client_id_env` | `BW_CLIENTID` | Name of the personal API-key client-ID env var |
+| `client_secret_env` | `BW_CLIENTSECRET` | Name of the personal API-key client-secret env var |
+| `master_password_env` | `BW_MASTER_PASSWORD` | Name of the master-password env var |
+| `server_url` | — | Vaultwarden URL used by this profile's isolated CLI state |
+| `item_id` | — | Immutable vault item UUID (preferred) |
 | `item_name` | — | Vault item whose custom fields become env vars |
 | `username_env` | — | Env var for `login.username`; unset = not exported |
 | `password_env` | — | Env var for `login.password`; unset = not exported |
 | `notes_env` | — | Env var for the item's `notes`; unset = not exported |
 | `override_existing` | `false` | Overwrite vars already set by `.env`/shell (never another secret source) |
-| `cache_ttl_seconds` | `300` | TTL for both cache layers; `0` disables caching entirely |
+| `cache_ttl_seconds` | `0` | Plaintext cache TTL; disabled by default |
 | `binary_path` | — | Pin an exact `bw` binary path |
 | `timeout_seconds` | `120` | Orchestrator wall-clock budget around the fetch |
 
-Config keys are identical to the old in-tree PR #42300 branch — an
-existing config keeps working unchanged.
+Existing `BW_SESSION` + `item_name` configurations remain supported. Re-run
+setup to migrate to unattended authentication and immutable `item_id` lookup.
 
 ## Behaviour & caveats
 
@@ -93,20 +137,24 @@ existing config keeps working unchanged.
   into, so unset means not exported. If a binding's target name also
   matches a custom field, the login/notes value wins and a warning is
   emitted.
-- The session token env var is **protected** — a vault field named
-  `BW_SESSION` can never overwrite the credential used to reach the vault.
-- **Timing**: plugin secret sources are discovered *after* the very
-  first env load of the process that discovers them.  They apply to every
-  Hermes process spawned afterwards (gateway children, cron sessions,
-  subagents).  For secrets the first interactive process itself needs,
-  use `hermes vaultwarden sync --apply` or keep them in `.env`.
+- Bootstrap variables are **protected** — vault fields cannot overwrite the
+  session, API-key, or master-password variables used to reach the vault.
+- Current Hermes re-runs secret-source loading after plugin discovery, so a
+  newly discovered plugin can contribute secrets to the same invocation.
 - Failures (missing binary, expired session, unknown item) never block
   startup — they surface as one-line warnings with a machine-readable
   error kind.
-- Cache: in-process dict + `~/.hermes/cache/vaultwarden_cache.json`
-  (atomic writes, mode `0600`, keyed on a session fingerprint — the
-  token itself is never written).  A stale `bw_cache.json` from the old
-  in-tree branch is dead weight and safe to delete.
+- Plaintext caching is disabled by default. Setting a positive TTL enables an
+  in-process cache plus `$HERMES_HOME/cache/vaultwarden_cache.json` (atomic
+  mode `0600`, keyed on a session fingerprint; the token itself is not
+  written).
+
+## License status
+
+The upstream repository currently declares no license. That means the code is
+source-visible but does not presently grant general permission to copy,
+modify, or redistribute it. Contributors and adopters should ask the upstream
+maintainer to add an explicit license.
 
 ## Tests
 

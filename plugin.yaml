@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 1.0.0
+version: 1.1.0
 description: Vaultwarden / Bitwarden Password Manager (bw CLI) secret source
 author: hansipie
 kind: standalone

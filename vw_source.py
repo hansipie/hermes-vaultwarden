@@ -13,9 +13,10 @@ Design summary
   https://github.com/bitwarden/clients/releases.  Resolution order:
   ``secrets.vaultwarden.binary_path`` (pinned) → ``<hermes_home>/bin/bw``
   → ``PATH``.
-* The session token is stored in ``~/.hermes/.env`` as ``BW_SESSION``
-  (or the name chosen in ``secrets.vaultwarden.session_env``).  Obtain it
-  with ``export BW_SESSION=$(bw unlock --raw)`` after logging in.
+* Interactive use can provide a ``BW_SESSION`` token.  Unattended use can
+  mint one in memory from a personal API key plus the account master
+  password.  Auto-unlock never persists the session token and isolates the
+  ``bw`` data directory beneath the active Hermes home.
 * Secrets come from a single named vault item::
 
       bw get item -- "<item_name>"     (BW_SESSION passed via child env)
@@ -27,7 +28,9 @@ Design summary
   / ``notes_env`` — there's no default name to guess, so silence beats a
   wrong guess.  :meth:`VaultwardenSource.fetch` never writes
   ``os.environ`` itself.
-* Caching: two-layer (in-process dict + disk JSON via the shared
+* Caching is disabled by default because it stores resolved plaintext secret
+  values.  When explicitly enabled it is two-layer (in-process dict + disk
+  JSON via the shared
   :class:`agent.secret_sources._cache.DiskCache` substrate), written to
   ``<hermes_home>/cache/vaultwarden_cache.json``.
 * Failures NEVER block Hermes startup — ``fetch()`` returns a
@@ -44,27 +47,30 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from agent.secret_sources._cache import CachedFetch, DiskCache, resolve_cache_home
 from agent.secret_sources.base import (
     ErrorKind,
     FetchResult,
     SecretSource,
+    get_source_environment,
     is_valid_env_name,
     run_secret_cli,
     scrub_ansi,
 )
-from agent.secret_sources._cache import CachedFetch, DiskCache, resolve_cache_home
 
 logger = logging.getLogger(__name__)
 
 _BW_RUN_TIMEOUT = 30.0
 _DEFAULT_SESSION_ENV = "BW_SESSION"
-_DEFAULT_CACHE_TTL = 300.0
+_DEFAULT_CACHE_TTL = 0.0
+_DEFAULT_CLIENT_ID_ENV = "BW_CLIENTID"
+_DEFAULT_CLIENT_SECRET_ENV = "BW_CLIENTSECRET"
+_DEFAULT_MASTER_PASSWORD_ENV = "BW_MASTER_PASSWORD"
 
-# Extra env vars the bw child process may need beyond run_secret_cli's
-# base allowlist (HOME/PATH/locale).  BITWARDENCLI_APPDATA_DIR relocates
-# bw's data directory; without it a user with a custom location would
-# silently talk to an empty vault.
-_BW_ALLOW_ENV = ("BITWARDENCLI_APPDATA_DIR",)
+# Node-based ``bw`` supports private certificate authorities through this
+# standard variable.  The path is not secret; the CLI state directory is
+# supplied explicitly per invocation instead of inherited.
+_BW_ALLOW_ENV = ("NODE_EXTRA_CA_CERTS",)
 
 _CacheKey = Tuple[str, str, str, str, str, str]
 # (resolved_home, session_fingerprint, item_name,
@@ -133,64 +139,155 @@ def _session_fingerprint(session: str) -> str:
     return hashlib.sha256(session.encode("utf-8")).hexdigest()[:16]
 
 
+def _profile_bw_appdata(home_path: Path) -> Path:
+    """Return a private ``bw`` state directory scoped to one Hermes profile."""
+    path = home_path / "plugin-data" / "vaultwarden" / "bw-cli"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
+def _safe_env_name(value: object, default: str, config_key: str) -> str:
+    candidate = str(value or default).strip()
+    if not is_valid_env_name(candidate):
+        raise RuntimeError(
+            f"secrets.vaultwarden.{config_key} must name a valid environment variable"
+        )
+    return candidate
+
+
+def _run_bw(
+    binary: Path,
+    *args: str,
+    appdata_dir: Optional[Path] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+):
+    child_env = dict(extra_env or {})
+    if appdata_dir is not None:
+        child_env["BITWARDENCLI_APPDATA_DIR"] = str(appdata_dir)
+    return run_secret_cli(
+        [str(binary), *args],
+        allow_env=_BW_ALLOW_ENV,
+        extra_env=child_env,
+        timeout=_BW_RUN_TIMEOUT,
+    )
+
+
+def _bw_status(binary: Path, appdata_dir: Path) -> dict:
+    proc = _run_bw(binary, "status", "--raw", appdata_dir=appdata_dir)
+    if proc.returncode != 0:
+        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+        raise RuntimeError(f"bw status failed: {err[:200]}")
+    try:
+        status = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bw status returned non-JSON output: {exc}") from exc
+    if not isinstance(status, dict) or status.get("status") not in {
+        "unauthenticated", "locked", "unlocked"
+    }:
+        raise RuntimeError("bw status returned an unexpected authentication state")
+    return status
+
+
 def mint_session(
     binary: Path,
     *,
-    username_env: str = "BW_USERNAME",
-    master_password_env: str = "BW_MASTER_PASSWORD",
-    server_url_env: str = "VAULTWARDEN_URL",
-    allow_env: Tuple[str, ...] = (),
+    home_path: Path,
+    client_id_env: str = _DEFAULT_CLIENT_ID_ENV,
+    client_secret_env: str = _DEFAULT_CLIENT_SECRET_ENV,
+    master_password_env: str = _DEFAULT_MASTER_PASSWORD_ENV,
+    server_url: str = "",
 ) -> str:
-    """Mint a fresh ``bw`` session token in memory (auto-unlock mode).
+    """Mint a ``bw`` session without prompts or persistent session tokens.
 
-    Runs ``bw config server`` and ``bw login <username> --passwordenv
-    <MASTER_PASSWORD_ENV> --raw`` using the machine account credentials from
-    the process environment (Coolify-injected bootstrap vars). The master
-    password travels via the child environment (``--passwordenv``) — never
-    argv. The returned token lives ONLY in the caller's memory — it is never
-    written to disk, ``.env`` or any config file.
-
-    Note: the ``bw`` CLI refuses organization API keys
-    (``bw login --apikey``; bitwarden/clients#11965) and requires the master
-    password to unlock anyway, so the machine identity is a dedicated 2FA-less
-    bot account (``BW_USERNAME``) with a strong master password
-    (``BW_MASTER_PASSWORD``).
-
-    Raises :class:`RuntimeError` on any failure (missing env, login or
-    unlock rejection) — callers map it onto the ErrorKind taxonomy.
+    A personal Bitwarden API key authenticates an unauthenticated CLI; the
+    master password decrypts the vault.  Login state is stored in a private
+    directory beneath ``home_path`` so Hermes profiles cannot race or inherit
+    one another's Bitwarden state.  Credential values travel only in the child
+    environment and the returned session exists only in process memory.
     """
-    username = os.environ.get(username_env, "").strip()
-    master_password = os.environ.get(master_password_env, "").strip()
-    server_url = os.environ.get(server_url_env, "").strip()
-    if not username or not master_password:
-        raise RuntimeError(
-            f"auto_unlock requires {username_env} and {master_password_env} "
-            "in the process environment (Coolify env)"
-        )
+    client_id_env = _safe_env_name(client_id_env, _DEFAULT_CLIENT_ID_ENV, "client_id_env")
+    client_secret_env = _safe_env_name(
+        client_secret_env, _DEFAULT_CLIENT_SECRET_ENV, "client_secret_env"
+    )
+    master_password_env = _safe_env_name(
+        master_password_env, _DEFAULT_MASTER_PASSWORD_ENV, "master_password_env"
+    )
+    source_env = get_source_environment()
+    credentials = {
+        client_id_env: str(source_env.get(client_id_env) or "").strip(),
+        client_secret_env: str(source_env.get(client_secret_env) or "").strip(),
+        master_password_env: str(source_env.get(master_password_env) or "").strip(),
+    }
+    missing = [name for name, value in credentials.items() if not value]
+    if missing:
+        raise RuntimeError("auto_unlock requires environment variables: " + ", ".join(missing))
 
-    if server_url:
-        proc = run_secret_cli(
-            [str(binary), "config", "server", server_url],
-            allow_env=allow_env,
-            timeout=_BW_RUN_TIMEOUT,
+    appdata_dir = _profile_bw_appdata(home_path)
+    status = _bw_status(binary, appdata_dir)
+    configured_server = str(status.get("serverUrl") or "").rstrip("/")
+    requested_server = str(server_url or "").strip().rstrip("/")
+    if not requested_server:
+        raise RuntimeError(
+            "auto_unlock requires an explicit secrets.vaultwarden.server_url"
+        )
+    if not requested_server.startswith("https://"):
+        raise RuntimeError("secrets.vaultwarden.server_url must use HTTPS")
+    if requested_server and configured_server and requested_server != configured_server:
+        raise RuntimeError(
+            "configured bw server does not match secrets.vaultwarden.server_url; "
+            "run `hermes vaultwarden reset-auth` before changing servers"
+        )
+    if requested_server and not configured_server:
+        if status["status"] != "unauthenticated":
+            raise RuntimeError("bw server cannot be changed while the profile is authenticated")
+        proc = _run_bw(
+            binary, "config", "server", requested_server, appdata_dir=appdata_dir
         )
         if proc.returncode != 0:
             err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
             raise RuntimeError(f"bw config server failed: {err[:200]}")
+        persisted = str(_bw_status(binary, appdata_dir).get("serverUrl") or "").rstrip("/")
+        if persisted != requested_server:
+            raise RuntimeError(
+                "bw did not persist the configured server in the profile state directory; "
+                "use the standalone Bitwarden CLI or grant the sandboxed CLI access to "
+                "the Hermes profile directory"
+            )
 
-    proc = run_secret_cli(
-        [str(binary), "login", username, "--passwordenv", master_password_env, "--raw"],
-        allow_env=allow_env,
-        extra_env={master_password_env: master_password},
-        timeout=_BW_RUN_TIMEOUT,
+    if status["status"] == "unauthenticated":
+        proc = _run_bw(
+            binary,
+            "login",
+            "--apikey",
+            appdata_dir=appdata_dir,
+            extra_env={
+                "BW_CLIENTID": credentials[client_id_env],
+                "BW_CLIENTSECRET": credentials[client_secret_env],
+            },
+        )
+        if proc.returncode != 0:
+            err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+            raise RuntimeError(f"bw API-key login failed: {err[:200]}")
+
+    proc = _run_bw(
+        binary,
+        "unlock",
+        "--passwordenv",
+        master_password_env,
+        "--raw",
+        appdata_dir=appdata_dir,
+        extra_env={master_password_env: credentials[master_password_env]},
     )
     if proc.returncode != 0:
         err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-        raise RuntimeError(f"bw login failed: {err[:200]}")
-
+        raise RuntimeError(f"bw unlock failed: {err[:200]}")
     session = (proc.stdout or "").strip()
     if not session:
-        raise RuntimeError("bw login --raw returned an empty session token")
+        raise RuntimeError("bw unlock --raw returned an empty session token")
     return session
 
 
@@ -205,6 +302,7 @@ def fetch_vaultwarden_secrets(
     username_env: Optional[str] = None,
     password_env: Optional[str] = None,
     notes_env: Optional[str] = None,
+    appdata_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull secrets from a vault item via ``bw get item``.
 
@@ -254,12 +352,13 @@ def fetch_vaultwarden_secrets(
         username_env=username_env,
         password_env=password_env,
         notes_env=notes_env,
+        appdata_dir=appdata_dir,
     )
     import time as _time
 
     entry = CachedFetch(secrets=secrets, fetched_at=_time.time())
-    _CACHE[cache_key] = entry
-    if use_cache:
+    if use_cache and cache_ttl_seconds > 0:
+        _CACHE[cache_key] = entry
         _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
     return secrets, warnings
 
@@ -272,6 +371,7 @@ def _run_bw_get_item(
     username_env: Optional[str] = None,
     password_env: Optional[str] = None,
     notes_env: Optional[str] = None,
+    appdata_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     # Session travels via the child env (bw reads BW_SESSION natively)
     # instead of a --session argv flag, keeping the token out of
@@ -279,10 +379,13 @@ def _run_bw_get_item(
     # `get item` rejects the terminator ("Not found."), so the item name
     # is passed directly. bw's CLI does not treat a plain search term
     # starting with "-" as a flag for this command.
+    child_env = {"BW_SESSION": session}
+    if appdata_dir is not None:
+        child_env["BITWARDENCLI_APPDATA_DIR"] = str(appdata_dir)
     proc = run_secret_cli(
         [str(bw), "get", "item", item_name],
         allow_env=_BW_ALLOW_ENV,
-        extra_env={"BW_SESSION": session},
+        extra_env=child_env,
         timeout=_BW_RUN_TIMEOUT,
     )
 
@@ -357,13 +460,33 @@ def _run_bw_get_item(
 
 def _classify_bw_error(message: str) -> ErrorKind:
     lowered = (message or "").lower()
+    if any(
+        token in lowered
+        for token in (
+            "requires environment variables",
+            "must name a valid environment",
+            "requires an explicit secrets.vaultwarden.server_url",
+            "server_url must use https",
+        )
+    ):
+        return ErrorKind.NOT_CONFIGURED
     if "timed out" in lowered:
         return ErrorKind.TIMEOUT
     if "failed to invoke" in lowered or "binary not found" in lowered:
         return ErrorKind.BINARY_MISSING
+    if any(
+        tok in lowered
+        for tok in (
+            "api-key login failed",
+            "invalid client",
+            "invalid master password",
+            "credentials rejected",
+        )
+    ):
+        return ErrorKind.AUTH_FAILED
     if any(tok in lowered for tok in (
         "session", "unlock", "not logged in", "vault is locked", "locked",
-        "unauthorized", "invalid master password", "mac failed",
+        "unauthorized", "mac failed",
     )):
         return ErrorKind.AUTH_EXPIRED
     if "not found" in lowered or "more than one result" in lowered:
@@ -423,12 +546,18 @@ class VaultwardenSource(SecretSource):
     scheme = None
 
     def protected_env_vars(self, cfg: dict):
-        session_env = _DEFAULT_SESSION_ENV
-        if isinstance(cfg, dict):
-            candidate = str(cfg.get("session_env") or session_env)
+        cfg = cfg if isinstance(cfg, dict) else {}
+        protected = set()
+        for key, default in (
+            ("session_env", _DEFAULT_SESSION_ENV),
+            ("client_id_env", _DEFAULT_CLIENT_ID_ENV),
+            ("client_secret_env", _DEFAULT_CLIENT_SECRET_ENV),
+            ("master_password_env", _DEFAULT_MASTER_PASSWORD_ENV),
+        ):
+            candidate = str(cfg.get(key) or default)
             if is_valid_env_name(candidate):
-                session_env = candidate
-        return frozenset({session_env})
+                protected.add(candidate)
+        return frozenset(protected)
 
     def config_schema(self) -> dict:
         return {
@@ -440,23 +569,30 @@ class VaultwardenSource(SecretSource):
             "auto_unlock": {
                 "description": (
                     "When true and no session token is present in session_env, "
-                    "mint one in memory via `bw login <username> --passwordenv ...` "
-                    "using BW_USERNAME / BW_MASTER_PASSWORD / VAULTWARDEN_URL from "
-                    "the process environment. The token is never persisted."
+                    "authenticate with a personal API key and mint a session in "
+                    "memory. The token is never persisted."
                 ),
                 "default": False,
             },
-            "username_login_env": {
-                "description": "Env var holding the bot username for auto_unlock",
-                "default": "BW_USERNAME",
+            "client_id_env": {
+                "description": "Env var holding the personal API-key client ID",
+                "default": _DEFAULT_CLIENT_ID_ENV,
+            },
+            "client_secret_env": {
+                "description": "Env var holding the personal API-key client secret",
+                "default": _DEFAULT_CLIENT_SECRET_ENV,
             },
             "master_password_env": {
-                "description": "Env var holding the bot master password for auto_unlock",
-                "default": "BW_MASTER_PASSWORD",
+                "description": "Env var holding the account master password",
+                "default": _DEFAULT_MASTER_PASSWORD_ENV,
             },
-            "server_url_env": {
-                "description": "Env var holding the vault URL for auto_unlock",
-                "default": "VAULTWARDEN_URL",
+            "server_url": {
+                "description": "Vaultwarden server URL for this Hermes profile",
+                "default": "",
+            },
+            "item_id": {
+                "description": "Preferred immutable vault item ID",
+                "default": "",
             },
             "item_name": {
                 "description": "Vault item whose custom fields become env vars",
@@ -505,13 +641,19 @@ class VaultwardenSource(SecretSource):
         result = FetchResult()
         cfg = cfg if isinstance(cfg, dict) else {}
 
-        session_env = str(cfg.get("session_env") or _DEFAULT_SESSION_ENV)
-        session = os.environ.get(session_env, "").strip()
+        try:
+            session_env = _safe_env_name(
+                cfg.get("session_env"), _DEFAULT_SESSION_ENV, "session_env"
+            )
+        except RuntimeError as exc:
+            result.error = str(exc)
+            result.error_kind = ErrorKind.NOT_CONFIGURED
+            return result
+        session = str(get_source_environment().get(session_env) or "").strip()
 
         auto_unlock = bool(cfg.get("auto_unlock", False))
+        appdata_dir: Optional[Path] = None
         if not session and auto_unlock:
-            # B2: mint a session in memory from the bot account credentials
-            # (Coolify-injected bootstrap vars). Never persisted.
             binary0 = find_bw(cfg.get("binary_path"))
             if binary0 is None:
                 result.error = (
@@ -523,11 +665,18 @@ class VaultwardenSource(SecretSource):
             try:
                 session = mint_session(
                     binary0,
-                    username_env=str(cfg.get("username_login_env") or "BW_USERNAME"),
-                    master_password_env=str(cfg.get("master_password_env") or "BW_MASTER_PASSWORD"),
-                    server_url_env=str(cfg.get("server_url_env") or "VAULTWARDEN_URL"),
+                    home_path=home_path,
+                    client_id_env=str(cfg.get("client_id_env") or _DEFAULT_CLIENT_ID_ENV),
+                    client_secret_env=str(
+                        cfg.get("client_secret_env") or _DEFAULT_CLIENT_SECRET_ENV
+                    ),
+                    master_password_env=str(
+                        cfg.get("master_password_env") or _DEFAULT_MASTER_PASSWORD_ENV
+                    ),
+                    server_url=str(cfg.get("server_url") or ""),
                 )
-                result.warnings.append("auto_unlock: minted a fresh session (never persisted)")
+                appdata_dir = _profile_bw_appdata(home_path)
+                result.warnings.append("auto_unlock: minted an in-memory session")
             except RuntimeError as exc:
                 result.error = str(exc)
                 result.error_kind = _classify_bw_error(str(exc))
@@ -538,15 +687,15 @@ class VaultwardenSource(SecretSource):
                 f"secrets.vaultwarden.enabled is true but {session_env} is not "
                 "set. Run `hermes vaultwarden setup`, or set "
                 "secrets.vaultwarden.auto_unlock=true to mint a session from "
-                "BW_USERNAME / BW_MASTER_PASSWORD in the process environment."
+                "a personal API key and master password."
             )
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
 
-        item_name = str(cfg.get("item_name") or "").strip()
+        item_name = str(cfg.get("item_id") or cfg.get("item_name") or "").strip()
         if not item_name:
             result.error = (
-                "secrets.vaultwarden.item_name is empty.  "
+                "secrets.vaultwarden.item_id/item_name is empty.  "
                 "Run `hermes vaultwarden setup`."
             )
             result.error_kind = ErrorKind.NOT_CONFIGURED
@@ -580,6 +729,7 @@ class VaultwardenSource(SecretSource):
                 username_env=login_bindings["username_env"],
                 password_env=login_bindings["password_env"],
                 notes_env=login_bindings["notes_env"],
+                appdata_dir=appdata_dir,
             )
         except RuntimeError as exc:
             result.error = str(exc)
