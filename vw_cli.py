@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from agent.secret_sources import registry as secret_registry
 from agent.secret_sources.base import is_valid_env_name, run_secret_cli
 from hermes_cli.config import load_config, save_config
 from hermes_constants import get_hermes_home
@@ -66,7 +67,8 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
         "--server-url",
         help=(
             "Vaultwarden / Bitwarden server URL (e.g. https://vw.example.com). "
-            "Runs `bw config server <url>` when provided.  "
+            "Interactive mode verifies the existing bw configuration; "
+            "auto-unlock configures its isolated profile when needed.  "
             "Skip to keep the current bw server configuration."
         ),
     )
@@ -111,6 +113,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     console = Console()
+    cfg = load_config()
+    secrets_cfg = (cfg.setdefault("secrets", {})
+                     .setdefault("vaultwarden", {}))
     console.print(
         Panel.fit(
             "[bold]Vaultwarden / Bitwarden Password Manager setup[/bold]\n\n"
@@ -134,7 +139,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ binary
     console.print()
     console.print("[bold]Step 1[/bold]  Locate the bw CLI")
-    binary = vw.find_bw(args.binary_path)
+    requested_binary = str(args.binary_path or "").strip()
+    configured_binary = str(secrets_cfg.get("binary_path") or "").strip()
+    binary = vw.find_bw(requested_binary or configured_binary or None)
     if binary is None:
         console.print(
             "  [red]bw not found on PATH or in <hermes_home>/bin.[/red]\n\n"
@@ -171,8 +178,24 @@ def cmd_setup(args: argparse.Namespace) -> int:
             return 1
 
     # ------------------------------------------------------------------ server
-    server_url = (args.server_url or "").strip()
-    if not server_url and not args.auto_unlock:
+    server_url = (args.server_url or "").strip().rstrip("/")
+    if server_url and not args.auto_unlock:
+        if not server_url.startswith("https://"):
+            console.print("  [red]--server-url must use HTTPS.[/red]")
+            return 1
+        current_server = _bw_current_server(binary).rstrip("/")
+        if current_server != server_url:
+            configured = current_server or "(default or unavailable)"
+            console.print(
+                "  [red]The configured bw server does not match --server-url.[/red]\n"
+                f"  Configured: [cyan]{configured}[/cyan]\n"
+                f"  Requested:  [cyan]{server_url}[/cyan]\n\n"
+                f"  Run [cyan]bw config server {server_url}[/cyan], then log in, "
+                "unlock, and re-run setup."
+            )
+            return 1
+        console.print(f"  [green]✓[/green] verified bw server: {current_server}")
+    elif not server_url and not args.auto_unlock:
         current_server = _bw_current_server(binary)
         if current_server:
             console.print(
@@ -183,9 +206,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ session
     console.print()
     console.print("[bold]Step 3[/bold]  Authenticate")
-    cfg = load_config()
-    secrets_cfg = (cfg.setdefault("secrets", {})
-                     .setdefault("vaultwarden", {}))
     session_env = secrets_cfg.get("session_env", "BW_SESSION")
 
     session = os.environ.get(session_env, "").strip()
@@ -350,7 +370,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     secrets_cfg.setdefault("session_env", session_env)
     secrets_cfg.setdefault("cache_ttl_seconds", 0)
     secrets_cfg.setdefault("override_existing", False)
-    if args.binary_path:
+    if requested_binary:
         secrets_cfg["binary_path"] = str(binary)
 
     for key, value in (
@@ -477,8 +497,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
         console.print("[red]No item_name configured.[/red]")
         return 1
 
-    login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
-
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     if binary is None:
         console.print("[red]bw binary not found.[/red]")
@@ -521,48 +539,92 @@ def cmd_sync(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         console.print(f"[yellow]bw sync skipped: {exc}[/yellow]")
 
-    try:
-        secrets, warnings = vw.fetch_vaultwarden_secrets(
-            session=session,
-            item_name=item_name,
-            binary=binary,
-            use_cache=False,
-            username_env=login_bindings["username_env"],
-            password_env=login_bindings["password_env"],
-            notes_env=login_bindings["notes_env"],
-            appdata_dir=appdata_dir,
+    # Stage the normal full-source orchestration pass in a private mapping.
+    # This preserves protected variables, preserve_existing, mapped-vs-bulk
+    # precedence, first-claim-wins, and provenance.  --apply controls only
+    # whether Vaultwarden-attributed results are committed to this process;
+    # it never changes override_existing semantics.
+    secrets_cfg = cfg.get("secrets") or {}
+    orchestrated_cfg = dict(secrets_cfg) if isinstance(secrets_cfg, dict) else {}
+    orchestrated_vw_cfg = dict(vw_cfg)
+    orchestrated_vw_cfg["cache_ttl_seconds"] = 0
+    orchestrated_cfg["vaultwarden"] = orchestrated_vw_cfg
+    staged_env = dict(os.environ)
+    staged_env[session_env] = session
+    report = secret_registry.apply_all(
+        orchestrated_cfg,
+        get_hermes_home(),
+        environ=staged_env,
+    )
+    vw_report = next((sr for sr in report.sources if sr.name == "vaultwarden"), None)
+    if vw_report is None:
+        console.print(
+            "[red]Vaultwarden secret source is not registered in the Hermes "
+            "orchestrator.[/red]"
         )
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]Fetch failed: {exc}[/red]")
+        return 1
+    if not vw_report.result.ok:
+        console.print(f"[red]Fetch failed: {vw_report.result.error}[/red]")
         return 1
 
-    warnings = list(warnings) + binding_warnings
-    for w in warnings:
-        console.print(f"[yellow]warning:[/yellow] {w}")
+    for warning in vw_report.result.warnings:
+        console.print(f"[yellow]warning:[/yellow] {warning}")
+    contested = set(vw_report.skipped_claimed)
+    for warning in report.conflicts:
+        if any(warning.startswith(f"{name}:") for name in contested):
+            console.print(f"[yellow]warning:[/yellow] {warning}")
 
-    if not secrets:
+    attributed = {
+        name
+        for name, provenance in report.provenance.items()
+        if provenance.source == "vaultwarden"
+    }
+    names = sorted(
+        set(vw_report.result.secrets)
+        | attributed
+        | set(vw_report.skipped_existing)
+        | set(vw_report.skipped_claimed)
+        | set(vw_report.skipped_protected)
+        | set(vw_report.skipped_invalid)
+    )
+    if not names:
         console.print("[yellow]No usable fields in vault item.[/yellow]")
         return 0
 
-    override = bool(vw_cfg.get("override_existing", False)) or args.apply
+    preserve_raw = orchestrated_cfg.get("preserve_existing")
+    preserve = {
+        name.strip()
+        for name in preserve_raw
+        if isinstance(name, str) and name.strip()
+    } if isinstance(preserve_raw, list) else set()
     table = Table(show_header=True, header_style="bold")
     table.add_column("Field name", style="cyan")
     table.add_column("Action")
     applied = 0
-    for key in sorted(secrets):
-        if key == session_env:
-            table.add_row(key, "[dim]skip (session token)[/dim]")
-            continue
-        already = bool(os.environ.get(key))
-        if already and not override:
-            table.add_row(key, "[dim]skip (already set)[/dim]")
-            continue
-        if args.apply:
-            os.environ[key] = secrets[key]
-            applied += 1
-            table.add_row(key, "[green]exported[/green]" + (" (overrode)" if already else ""))
+    for key in names:
+        if key in attributed:
+            provenance = report.provenance.get(key)
+            overrode = bool(provenance and provenance.overrode_env)
+            if args.apply:
+                os.environ[key] = staged_env[key]
+                applied += 1
+                action = "[green]exported[/green]" + (" (overrode)" if overrode else "")
+            else:
+                action = "[green]would export[/green]" + (
+                    " (overrides)" if overrode else ""
+                )
+        elif key in vw_report.skipped_protected:
+            action = "[dim]skip (protected bootstrap variable)[/dim]"
+        elif key in vw_report.skipped_claimed:
+            action = "[dim]skip (claimed by another secret source)[/dim]"
+        elif key in vw_report.skipped_existing:
+            reason = "preserve_existing" if key in preserve else "already set"
+            action = f"[dim]skip ({reason})[/dim]"
+        elif key in vw_report.skipped_invalid:
+            action = "[dim]skip (invalid env-var name)[/dim]"
         else:
-            table.add_row(key, "[green]would export[/green]" + (" (overrides)" if already else ""))
+            action = "[dim]skip[/dim]"
+        table.add_row(key, action)
 
     console.print(table)
 

@@ -19,7 +19,10 @@ Design summary
   ``bw`` data directory beneath the active Hermes home.
 * Secrets come from a single named vault item::
 
-      bw get item -- "<item_name>"     (BW_SESSION passed via child env)
+      bw get item "<item_name>"        (BW_SESSION passed via child env)
+
+  ``bw`` rejects the usual ``--`` option terminator for this command, so
+  item references beginning with ``-`` are rejected before invocation.
 
   Every custom field whose name is a valid env-var identifier is offered
   to the orchestrator.  The item's structural ``login.username``,
@@ -320,6 +323,8 @@ def fetch_vaultwarden_secrets(
         raise RuntimeError("Vaultwarden session token is empty")
     if not item_name:
         raise RuntimeError("Vaultwarden item_name is empty")
+    if item_name.startswith("-"):
+        raise RuntimeError("Vaultwarden item reference cannot begin with '-'")
 
     cache_key: _CacheKey = (
         str(resolve_cache_home(home_path)),
@@ -375,10 +380,10 @@ def _run_bw_get_item(
 ) -> Tuple[Dict[str, str], List[str]]:
     # Session travels via the child env (bw reads BW_SESSION natively)
     # instead of a --session argv flag, keeping the token out of
-    # /proc/<pid>/cmdline.  NOTE: no `--` terminator here — bw 2026.7.0's
-    # `get item` rejects the terminator ("Not found."), so the item name
-    # is passed directly. bw's CLI does not treat a plain search term
-    # starting with "-" as a flag for this command.
+    # /proc/<pid>/cmdline.  NOTE: no `--` terminator here — bw 2026.8.0's
+    # `get item` rejects the terminator ("Not found."), so option-shaped
+    # item references are rejected by fetch_vaultwarden_secrets() before
+    # this command is built.
     child_env = {"BW_SESSION": session}
     if appdata_dir is not None:
         child_env["BITWARDENCLI_APPDATA_DIR"] = str(appdata_dir)
@@ -416,12 +421,15 @@ def _run_bw_get_item(
             continue
         name = f.get("name")
         value = f.get("value")
-        if not isinstance(name, str) or value is None:
+        if not isinstance(name, str):
             continue
-        value = str(value)
         if not is_valid_env_name(name):
             warnings.append(f"Skipping field {name!r}: not a valid env-var name")
             continue
+        if value is None or str(value) == "":
+            warnings.append(f"Skipping field {name!r}: value is empty")
+            continue
+        value = str(value)
         secrets[name] = value
 
     if not fields and not (username_env or password_env or notes_env):

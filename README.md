@@ -99,7 +99,7 @@ clears it from `config.yaml`.
 |---|---|
 | `hermes vaultwarden setup` | Configure authentication and select an item; `--item-id` is preferred |
 | `hermes vaultwarden status` | Config, binary, server, and bootstrap-variable presence (never values) |
-| `hermes vaultwarden sync` | `bw sync` + fresh fetch, dry-run table; `--apply` exports into the current process |
+| `hermes vaultwarden sync` | `bw sync` + fresh orchestrated fetch, dry-run table; `--apply` commits only Vaultwarden-attributed values to the current process |
 | `hermes vaultwarden reset-auth` | Log out only this Hermes profile's isolated `bw` state |
 | `hermes vaultwarden disable` | Flips `secrets.vaultwarden.enabled` to false and clears the disk cache |
 
@@ -139,6 +139,10 @@ setup to migrate to unattended authentication and immutable `item_id` lookup.
   emitted.
 - Bootstrap variables are **protected** — vault fields cannot overwrite the
   session, API-key, or master-password variables used to reach the vault.
+- Empty custom-field values are skipped with a warning, so an empty vault
+  field cannot erase a working credential even when overrides are enabled.
+- Item names and IDs beginning with `-` are rejected because current `bw`
+  treats them as options and rejects the usual `--` option terminator.
 - Current Hermes re-runs secret-source loading after plugin discovery, so a
   newly discovered plugin can contribute secrets to the same invocation.
 - Failures (missing binary, expired session, unknown item) never block

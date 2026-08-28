@@ -223,6 +223,20 @@ class TestFetchVaultwardenSecrets:
                 use_cache=False,
             )
 
+    @pytest.mark.parametrize("item_reference", ["-h", "--help"])
+    def test_rejects_option_shaped_item_reference(self, item_reference):
+        with (
+            mock.patch.object(vw, "run_secret_cli") as mock_run,
+            pytest.raises(RuntimeError, match="cannot begin with '-'"),
+        ):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name=item_reference,
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+            )
+        mock_run.assert_not_called()
+
     def test_raises_when_bw_fails(self, tmp_path):
         with mock.patch("subprocess.run", return_value=_make_fail_proc(1, "Not logged in")):
             with pytest.raises(RuntimeError, match="bw exited 1"):
@@ -843,6 +857,29 @@ class TestOrchestratedApply:
         sr = report.sources[0]
         assert "BW_SESSION" in sr.skipped_protected
         assert "SOME_KEY" in sr.applied
+
+    def test_empty_field_never_overwrites_existing_value(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        item = {
+            **_FAKE_ITEM,
+            "fields": [
+                {"name": "OPENROUTER_API_KEY", "value": "", "type": 1},
+                {"name": "SOME_KEY", "value": "val", "type": 1},
+            ],
+        }
+        environ = {"OPENROUTER_API_KEY": "working-value"}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(item)):
+            report = self._apply(
+                tmp_path, environ, cfg_extra={"override_existing": True}
+            )
+        assert environ["OPENROUTER_API_KEY"] == "working-value"
+        assert "OPENROUTER_API_KEY" not in report.provenance
+        assert "SOME_KEY" in report.provenance
+        assert any(
+            "OPENROUTER_API_KEY" in warning and "empty" in warning
+            for warning in report.sources[0].result.warnings
+        )
 
     def test_fetch_error_does_not_break_pass(self, monkeypatch, tmp_path):
         monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
