@@ -145,6 +145,10 @@ setup to migrate to unattended authentication and immutable `item_id` lookup.
   treats them as options and rejects the usual `--` option terminator.
 - Current Hermes re-runs secret-source loading after plugin discovery, so a
   newly discovered plugin can contribute secrets to the same invocation.
+- On every cache miss, the plugin runs native `bw sync` before `bw get item`.
+  A failed sync fails the source fetch rather than applying stale local-vault
+  data. A positive plaintext cache TTL intentionally defers both operations
+  until that cache entry expires; the default TTL is zero.
 - Failures (missing binary, expired session, unknown item) never block
   startup — they surface as one-line warnings with a machine-readable
   error kind.

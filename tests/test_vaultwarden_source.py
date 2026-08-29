@@ -238,15 +238,37 @@ class TestFetchVaultwardenSecrets:
         mock_run.assert_not_called()
 
     def test_raises_when_bw_fails(self, tmp_path):
-        with mock.patch("subprocess.run", return_value=_make_fail_proc(1, "Not logged in")):
-            with pytest.raises(RuntimeError, match="bw exited 1"):
-                vw.fetch_vaultwarden_secrets(
-                    session=_FAKE_SESSION,
-                    item_name="Hermes",
-                    binary=Path("/usr/bin/bw"),
-                    use_cache=False,
-                    home_path=tmp_path,
-                )
+        with (
+            mock.patch(
+                "subprocess.run",
+                side_effect=[_make_ok_proc({}), _make_fail_proc(1, "Not logged in")],
+            ),
+            pytest.raises(RuntimeError, match="bw exited 1"),
+        ):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+            )
+
+    def test_sync_failure_refuses_stale_local_item(self, tmp_path):
+        with (
+            mock.patch(
+                "subprocess.run", return_value=_make_fail_proc(1, "Network unavailable")
+            ) as mock_run,
+            pytest.raises(RuntimeError, match="bw sync failed"),
+        ):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+            )
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.args[0] == ["/usr/bin/bw", "sync"]
 
     def test_raises_when_bw_not_found(self, monkeypatch):
         monkeypatch.setattr(vw, "find_bw", lambda *a, **k: None)
@@ -269,7 +291,7 @@ class TestFetchVaultwardenSecrets:
                     cache_ttl_seconds=300,
                     home_path=tmp_path,
                 )
-        assert mock_run.call_count == 1
+        assert mock_run.call_count == 2
 
     def test_disk_cache_survives_process_cache_clear(self, tmp_path):
         with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
@@ -290,7 +312,7 @@ class TestFetchVaultwardenSecrets:
                 cache_ttl_seconds=300,
                 home_path=tmp_path,
             )
-        assert mock_run.call_count == 1
+        assert mock_run.call_count == 2
         assert "OPENROUTER_API_KEY" in secrets
 
     def test_expired_disk_cache_triggers_refetch(self, tmp_path):
@@ -317,7 +339,7 @@ class TestFetchVaultwardenSecrets:
                 use_cache=True,
                 home_path=tmp_path,
             )
-        assert mock_run.call_count == 2
+        assert mock_run.call_count == 4
 
     def test_item_with_no_fields_returns_empty_with_warning(self, tmp_path):
         item = {**_FAKE_ITEM, "fields": []}
@@ -428,7 +450,7 @@ class TestFetchVaultwardenSecrets:
                 home_path=tmp_path,
                 username_env="SVC_USER",
             )
-        assert mock_run.call_count == 2
+        assert mock_run.call_count == 4
         assert secrets["SVC_USER"] == "svc-hermes"
 
     def test_timeout_raises_runtime_error(self, tmp_path):
@@ -742,6 +764,7 @@ class TestVaultwardenSourceAutoUnlock:
                 _make_status("unauthenticated", "https://vault.example.com"),
                 _make_ok_proc({}),    # login --apikey
                 unlock_proc,          # unlock --passwordenv
+                _make_ok_proc({}),    # sync
                 _make_ok_proc(),      # get item
             ],
         ) as mock_run:
@@ -760,7 +783,9 @@ class TestVaultwardenSourceAutoUnlock:
         argv_text = " ".join(" ".join(c.args[0]) for c in mock_run.call_args_list)
         assert "auto-minted-session" not in argv_text
         assert "master-secret" not in argv_text
-        get_item_env = mock_run.call_args_list[5].kwargs["env"]
+        sync_env = mock_run.call_args_list[5].kwargs["env"]
+        get_item_env = mock_run.call_args_list[6].kwargs["env"]
+        assert sync_env["BW_SESSION"] == "auto-minted-session"
         assert get_item_env["BW_SESSION"] == "auto-minted-session"
         assert "BW_CLIENTSECRET" not in get_item_env
 
@@ -772,6 +797,33 @@ class TestVaultwardenSourceAutoUnlock:
         assert not result.ok
         assert result.error_kind is ErrorKind.NOT_CONFIGURED
         assert "auto_unlock" in result.error
+
+    def test_existing_session_with_auto_unlock_uses_profile_appdata(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("BW_SESSION", "existing-session")
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[_make_ok_proc({}), _make_ok_proc()],
+        ) as mock_run:
+            result = self.source.fetch(
+                {
+                    "enabled": True,
+                    "item_name": "Hermes",
+                    "auto_unlock": True,
+                    "server_url": "https://vault.example.com",
+                },
+                tmp_path,
+            )
+
+        assert result.ok
+        appdata = str(tmp_path / "plugin-data" / "vaultwarden" / "bw-cli")
+        assert all(
+            call.kwargs["env"]["BITWARDENCLI_APPDATA_DIR"] == appdata
+            for call in mock_run.call_args_list
+        )
 
     def test_auto_unlock_missing_bootstrap_env_reports_clean_error(self, monkeypatch, tmp_path):
         monkeypatch.delenv("BW_SESSION", raising=False)

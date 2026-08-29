@@ -503,7 +503,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return 1
 
     session = os.environ.get(session_env, "").strip()
-    appdata_dir = None
     if not session and vw_cfg.get("auto_unlock"):
         try:
             session = vw.mint_session(
@@ -514,7 +513,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 master_password_env=str(vw_cfg.get("master_password_env") or "BW_MASTER_PASSWORD"),
                 server_url=str(vw_cfg.get("server_url") or ""),
             )
-            appdata_dir = vw._profile_bw_appdata(get_hermes_home())
         except RuntimeError as exc:
             console.print(f"[red]Authentication failed: {exc}[/red]")
             return 1
@@ -523,21 +521,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return 1
 
     console.print("[dim]Syncing vault from server…[/dim]")
-    try:
-        child_env = {"BW_SESSION": session}
-        if appdata_dir is not None:
-            child_env["BITWARDENCLI_APPDATA_DIR"] = str(appdata_dir)
-        res = run_secret_cli(
-            [str(binary), "sync"],
-            allow_env=vw._BW_ALLOW_ENV,
-            extra_env=child_env,
-            timeout=30,
-        )
-        if res.returncode != 0:
-            err = (res.stderr or res.stdout or "").strip()[:200]
-            console.print(f"[yellow]bw sync warning: {err}[/yellow]")
-    except RuntimeError as exc:
-        console.print(f"[yellow]bw sync skipped: {exc}[/yellow]")
 
     # Stage the normal full-source orchestration pass in a private mapping.
     # This preserves protected variables, preserve_existing, mapped-vs-bulk

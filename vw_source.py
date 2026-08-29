@@ -17,9 +17,14 @@ Design summary
   mint one in memory from a personal API key plus the account master
   password.  Auto-unlock never persists the session token and isolates the
   ``bw`` data directory beneath the active Hermes home.
-* Secrets come from a single named vault item::
+* Secrets come from a single named vault item.  On every cache miss the
+  profile-local CLI vault is synchronized before the item is read::
 
+      bw sync
       bw get item "<item_name>"        (BW_SESSION passed via child env)
+
+  A failed sync fails the source fetch instead of silently applying stale
+  credentials from the CLI's local encrypted vault.
 
   ``bw`` rejects the usual ``--`` option terminator for this command, so
   item references beginning with ``-`` are rejected before invocation.
@@ -177,6 +182,29 @@ def _run_bw(
         extra_env=child_env,
         timeout=_BW_RUN_TIMEOUT,
     )
+
+
+def _sync_bw_vault(
+    binary: Path,
+    session: str,
+    *,
+    appdata_dir: Optional[Path] = None,
+) -> None:
+    """Refresh the CLI's encrypted local vault before reading an item.
+
+    ``bw get item`` reads local CLI state and does not implicitly contact the
+    server.  Without this sync, an unattended profile can keep serving a
+    rotated or corrected credential indefinitely across process restarts.
+    """
+    proc = _run_bw(
+        binary,
+        "sync",
+        appdata_dir=appdata_dir,
+        extra_env={"BW_SESSION": session},
+    )
+    if proc.returncode != 0:
+        err = scrub_ansi(proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"bw sync failed: {err[:200]}")
 
 
 def _bw_status(binary: Path, appdata_dir: Path) -> dict:
@@ -350,6 +378,7 @@ def fetch_vaultwarden_secrets(
             "https://github.com/bitwarden/clients/releases"
         )
 
+    _sync_bw_vault(bw, session, appdata_dir=appdata_dir)
     secrets, warnings = _run_bw_get_item(
         bw,
         session,
@@ -660,7 +689,9 @@ class VaultwardenSource(SecretSource):
         session = str(get_source_environment().get(session_env) or "").strip()
 
         auto_unlock = bool(cfg.get("auto_unlock", False))
-        appdata_dir: Optional[Path] = None
+        appdata_dir: Optional[Path] = (
+            _profile_bw_appdata(home_path) if auto_unlock else None
+        )
         if not session and auto_unlock:
             binary0 = find_bw(cfg.get("binary_path"))
             if binary0 is None:
@@ -683,7 +714,6 @@ class VaultwardenSource(SecretSource):
                     ),
                     server_url=str(cfg.get("server_url") or ""),
                 )
-                appdata_dir = _profile_bw_appdata(home_path)
                 result.warnings.append("auto_unlock: minted an in-memory session")
             except RuntimeError as exc:
                 result.error = str(exc)
