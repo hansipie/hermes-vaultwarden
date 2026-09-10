@@ -699,3 +699,60 @@ class TestDiskCache:
         vw._reset_cache_for_tests(tmp_path)
         assert not vw._CACHE
         assert not vw._disk_cache_path(tmp_path).exists()
+
+
+class TestItemNameEnvExpansion:
+    """The ``secrets:`` section reaches this plugin RAW (core's
+    _load_secrets_config → read_raw_config does no _expand_env_vars), so the
+    plugin must expand ${VAR}/${env:VAR} itself. Live repro (2026-09-09):
+    config ``item_name: ${BW_ITEM_NAME}`` reached `bw get item` as a literal
+    template → "bw exited 1: Not found." twice per boot."""
+
+    def setup_method(self):
+        vw._CACHE.clear()
+        self.source = vw.VaultwardenSource()
+
+    def test_expands_item_name_from_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setenv("BW_ITEM_NAME", "Hermes")
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
+            result = self.source.fetch(
+                {"enabled": True, "item_name": "${BW_ITEM_NAME}"}, tmp_path
+            )
+        assert result.ok
+        argv = mock_run.call_args.args[0]
+        assert "Hermes" in argv
+        assert "${BW_ITEM_NAME}" not in argv
+
+    def test_expands_env_prefixed_ref(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setenv("BW_ITEM_NAME", "Hermes")
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            result = self.source.fetch(
+                {"enabled": True, "item_name": "${env:BW_ITEM_NAME}"}, tmp_path
+            )
+        assert result.ok
+
+    def test_unresolved_ref_reports_not_configured_without_bw_call(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.delenv("BW_ITEM_NAME", raising=False)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch("subprocess.run") as mock_run:
+            result = self.source.fetch(
+                {"enabled": True, "item_name": "${BW_ITEM_NAME}"}, tmp_path
+            )
+        assert not result.ok
+        assert "unresolved" in result.error
+        assert result.error_kind is ErrorKind.NOT_CONFIGURED
+        mock_run.assert_not_called()  # never passes the literal template to bw
+
+    def test_expansion_helper_mirrors_core_semantics(self, monkeypatch):
+        monkeypatch.setenv("FOO", "bar")
+        assert vw._expand_env_refs("${FOO}") == "bar"
+        assert vw._expand_env_refs("${env:FOO}") == "bar"
+        assert vw._expand_env_refs("${FOO}-${FOO}") == "bar-bar"
+        assert vw._expand_env_refs("${MISSING_VAR}") == "${MISSING_VAR}"  # stays verbatim
+        assert vw._expand_env_refs("plain-name") == "plain-name"  # untouched
+        assert vw._expand_env_refs("${file:/etc/x}") == "${file:/etc/x}"  # non-env ref untouched

@@ -40,6 +40,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -47,6 +48,7 @@ from typing import Dict, List, Optional, Tuple
 from agent.secret_sources.base import (
     ErrorKind,
     FetchResult,
+    get_source_environment,
     SecretSource,
     is_valid_env_name,
     run_secret_cli,
@@ -65,6 +67,50 @@ _DEFAULT_CACHE_TTL = 300.0
 # bw's data directory; without it a user with a custom location would
 # silently talk to an empty vault.
 _BW_ALLOW_ENV = ("BITWARDENCLI_APPDATA_DIR",)
+
+# ---------------------------------------------------------------------------
+# Config ${VAR} / ${env:VAR} expansion (plugin-side, mirrors hermes_cli/config.py)
+# ---------------------------------------------------------------------------
+# Core intentionally reads the ``secrets:`` section RAW (_load_secrets_config →
+# read_raw_config; no _expand_env_vars on that path), and core's own expander
+# only handles the env shape ("external backends inject their values into the
+# environment at startup, so a config ref only ever needs the env shape"). The
+# bulk Vaultwarden source must therefore do the same expansion itself or a
+# config like ``item_name: ${BW_ITEM_NAME}`` reaches `bw get item` as a
+# literal template (observed: "bw exited 1: Not found." twice per boot).
+_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _env_ref_var_name(inner: str) -> Optional[str]:
+    """Var name for ``${VAR}`` (bare name) or ``${env:VAR}``; None otherwise."""
+    inner = inner.strip()
+    if inner.startswith("env:"):
+        inner = inner[4:].strip()
+    return inner if inner.isidentifier() else None
+
+
+def _env_ref_lookup(name: str) -> Optional[str]:
+    """Resolve an env var for a config ref: the per-fetch source environment
+    view (apply_all's ``environ`` — envdir + .env + .op.env merged) first, then
+    the process environment. Mirrors core's scope-aware _env_ref_lookup."""
+    source_env = get_source_environment()
+    val = source_env.get(name) if source_env is not None else None
+    if val is None:
+        val = os.environ.get(name)
+    return val
+
+
+def _expand_env_refs(value: str) -> str:
+    """Expand ``${VAR}``/``${env:VAR}``; unresolved stay verbatim (same policy
+    as core's _expand_env_vars) so callers can detect them."""
+    def _sub(m: "re.Match[str]") -> str:
+        name = _env_ref_var_name(m.group(1))
+        if name is None:
+            return m.group(0)
+        val = _env_ref_lookup(name)
+        return val if val is not None else m.group(0)
+    return _ENV_REF_RE.sub(_sub, value)
+
 
 _CacheKey = Tuple[str, str, str, str, str, str]
 # (resolved_home, session_fingerprint, item_name,
@@ -375,7 +421,11 @@ class VaultwardenSource(SecretSource):
                 "default": _DEFAULT_SESSION_ENV,
             },
             "item_name": {
-                "description": "Vault item whose custom fields become env vars",
+                "description": (
+                    "Vault item whose custom fields become env vars.  "
+                    "${VAR} / ${env:VAR} references are expanded from the "
+                    "source environment (envdir/.env/process env)."
+                ),
                 "default": "",
             },
             "username_env": {
@@ -433,13 +483,24 @@ class VaultwardenSource(SecretSource):
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
 
-        item_name = str(cfg.get("item_name") or "").strip()
-        if not item_name:
+        item_name = _expand_env_refs(str(cfg.get("item_name") or "").strip()).strip()
+        if not item_name or _ENV_REF_RE.search(item_name):
             result.error = (
-                "secrets.vaultwarden.item_name is empty.  "
-                "Run `hermes vaultwarden setup`."
+                "secrets.vaultwarden.item_name is empty or contains an unresolved "
+                "${VAR} reference.  Set the variable in the environment (envdir/"
+                ".env) or run `hermes vaultwarden setup`."
             )
             result.error_kind = ErrorKind.NOT_CONFIGURED
+            return result
+
+        binary = find_bw(cfg.get("binary_path"))
+        result.binary_path = binary
+        if binary is None:
+            result.error = (
+                "bw binary not found.  Install it from your package manager or "
+                "https://github.com/bitwarden/clients/releases"
+            )
+            result.error_kind = ErrorKind.BINARY_MISSING
             return result
 
         binary = find_bw(cfg.get("binary_path"))
