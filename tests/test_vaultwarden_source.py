@@ -699,3 +699,375 @@ class TestDiskCache:
         vw._reset_cache_for_tests(tmp_path)
         assert not vw._CACHE
         assert not vw._disk_cache_path(tmp_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# Self-heal: re-derive the session when the stored token is dead
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# Self-heal: re-derive the session when the stored token is dead
+# ---------------------------------------------------------------------------
+
+
+def _tok(ch: str) -> str:
+    """A stand-in for a real 88-char base64 session token (kept out of
+    literal form so tool-side secret redaction can never mask it)."""
+    return ch * 88
+
+
+class TestSelfHeal:
+    def setup_method(self):
+        vw._CACHE.clear()
+        vw._HEAL_ATTEMPTED = False
+
+    _HEAL_PW_FILE_CONTENT = (
+        "# heal credentials for the vaultwarden secret source\n"
+        "BW_SERVER_URL=https://vw.example.test\n"
+        "BW_CLIENT_ID=user.aaaa-1111\n"
+        "BW_CLIENT_SECRET=sec-2222\n"
+        "BW_PASSWORD=hunter2\n"
+    )
+
+    def _write_pw_file(self, tmp_path, content=None):
+        pw_file = tmp_path / "bw.env"
+        pw_file.write_text(content if content is not None else self._HEAL_PW_FILE_CONTENT)
+        return pw_file
+
+    def _dead_item_proc(self):
+        proc = mock.MagicMock()
+        proc.returncode = 0
+        proc.stdout = ""  # dead session: bw prompts, prints nothing
+        proc.stderr = ""
+        return proc
+
+    def _unlock_proc(self, token):
+        proc = mock.MagicMock()
+        proc.returncode = 0
+        proc.stdout = token + "\n"
+        proc.stderr = ""
+        return proc
+
+    def _side_effect(self, unlock_token):
+        """First call: get item with dead session -> empty. Then login,
+        unlock (token), and a successful get item with the fresh token."""
+        return [
+            self._dead_item_proc(),
+            _make_ok_proc(),  # apikey login (stdout may be empty)
+            self._unlock_proc(unlock_token),
+            _make_ok_proc(),  # retry with healed session
+        ]
+
+    def test_dead_session_triggers_heal_and_refreshes_env_file(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        env_file = tmp_path / ".env"
+        env_file.write_text("TELEGRAM_BOT_TOKEN=123\nBW_SESSION=deadtok0")
+        unlock_token = _tok("b")
+
+        with mock.patch("subprocess.run", side_effect=self._side_effect(unlock_token)) as mock_run:
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert any("self-heal ok" in w for w in warnings)
+        # .env refreshed in place, other lines untouched, 0600
+        text = env_file.read_text()
+        assert ("BW_SESSION=" + unlock_token) in text
+        assert "TELEGRAM_BOT_TOKEN=123" in text
+        assert "dead-token-000" not in text
+        assert env_file.stat().st_mode & 0o777 == 0o600
+        # argv check: get item (dead) -> login --apikey -> unlock --passwordenv -> get item (fresh)
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0][-2:] == ["--", "Hermes"]
+        assert calls[1][1:4] == ["login", "--apikey", "--raw"]
+        assert calls[2][1:5] == ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"]
+        assert calls[3][-2:] == ["--", "Hermes"]
+        # secret hygiene: password never in argv; client creds only on login
+        for argv in calls:
+            assert "hunter2" not in argv
+            assert "sec-2222" not in argv
+        envs = [c.kwargs["env"] for c in mock_run.call_args_list]
+        assert envs[1]["BW_CLIENTID"] == "user.aaaa-1111"
+        assert envs[1]["BW_CLIENTSECRET"] == "sec-2222"
+        assert envs[1]["NODE_OPTIONS"] == "--no-deprecation"
+        assert "BW_PASSWORD" not in envs[1]
+        assert envs[2]["BW_PASSWORD"] == "hunter2"
+        assert envs[3]["BW_SESSION"] == unlock_token
+        # NODE_OPTIONS rides along on the item fetch too
+        assert envs[0]["NODE_OPTIONS"] == "--no-deprecation"
+
+    def test_no_apikey_pair_skips_login_step(self, tmp_path):
+        pw_file = self._write_pw_file(
+            tmp_path, "BW_PASSWORD=hunter2\n"
+        )
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                self._dead_item_proc(),
+                self._unlock_proc(_tok("c")),
+                _make_ok_proc(),
+            ],
+        ) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert len(calls) == 3  # no login step
+        assert calls[1][1:5] == ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"]
+
+    def test_password_with_space_uses_passwordfile(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path, "BW_PASSWORD=hunter2 badger\n")
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                self._dead_item_proc(),
+                self._unlock_proc(_tok("d")),
+                _make_ok_proc(),
+            ],
+        ) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        unlock_argv = mock_run.call_args_list[1].args[0]
+        assert unlock_argv[1:3] == ["unlock", "--passwordfile"]
+        assert not unlock_argv[3].startswith("-")
+        assert not Path(unlock_argv[3]).exists()  # temp file removed
+        assert "BW_PASSWORD" not in mock_run.call_args_list[1].kwargs["env"]
+
+    def test_heal_disabled_keeps_original_result(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        with mock.patch("subprocess.run", return_value=self._dead_item_proc()) as mock_run:
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=False,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets == {}
+        assert "bw returned no output" in warnings
+        assert mock_run.call_count == 1
+
+    def test_missing_password_file_no_crash(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=self._dead_item_proc()) as mock_run:
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(tmp_path / "absent.env"),
+            )
+        assert secrets == {}
+        assert any("self-heal skipped" in w for w in warnings)
+        assert mock_run.call_count == 1
+
+    def test_unlock_without_token_falls_back_to_original(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                self._dead_item_proc(),
+                _make_ok_proc(),
+                self._unlock_proc("no-token-here"),
+            ],
+        ) as mock_run:
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets == {}
+        assert any("self-heal failed" in w for w in warnings)
+        assert mock_run.call_count == 3  # no retry after failed heal
+
+    def test_one_heal_attempt_per_process(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        dead = self._dead_item_proc()
+        with mock.patch(
+            "subprocess.run",
+            # attempt 1: get item (dead) + login + unlock (no token);
+            # then endless dead item fetches for the second call
+            side_effect=[dead, _make_ok_proc(), self._unlock_proc("no-token-here")]
+            + [dead] * 10,
+        ) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+            # flag consumed: second fetch must not re-derive
+            secrets, _ = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets == {}
+        assert mock_run.call_count == 4  # (get+login+unlock) + get
+
+    def test_healthy_session_does_not_heal(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert not any("self-heal" in w for w in warnings)
+        assert mock_run.call_count == 1
+
+    def test_item_with_no_fields_does_not_heal(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        item = {**_FAKE_ITEM, "fields": []}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(item)) as mock_run:
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets == {}
+        assert any("no custom fields" in w for w in warnings)
+        assert mock_run.call_count == 1
+
+    def test_token_extraction_last_matching_line(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        token = "e" * 80 + "=="
+        proc = mock.MagicMock()
+        proc.returncode = 0
+        proc.stdout = f"You are now unlocked.\n{token}\n"
+        proc.stderr = ""
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[self._dead_item_proc(), _make_ok_proc(), proc, _make_ok_proc()],
+        ):
+            secrets, _ = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+
+    def test_env_file_absent_is_not_an_error(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                self._dead_item_proc(),
+                _make_ok_proc(),
+                self._unlock_proc(_tok("f")),
+                _make_ok_proc(),
+            ],
+        ):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        assert secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert any("in-memory only" in w for w in warnings)
+
+    def test_env_file_without_session_line_appends(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        env_file = tmp_path / ".env"
+        env_file.write_text("OTHER=1\n")
+        token = _tok("g")
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                self._dead_item_proc(),
+                _make_ok_proc(),
+                self._unlock_proc(token),
+                _make_ok_proc(),
+            ],
+        ):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        text = env_file.read_text()
+        assert "OTHER=1" in text
+        assert ("BW_SESSION=" + token) in text
+
+    def test_failed_heal_result_not_cached(self, tmp_path):
+        pw_file = self._write_pw_file(tmp_path)
+        with mock.patch("subprocess.run", return_value=self._dead_item_proc()) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+            vw._HEAL_ATTEMPTED = False  # second process-like attempt
+            vw._CACHE.clear()
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+                self_heal=True,
+                heal_password_file=str(pw_file),
+            )
+        # each attempt: get item + login + unlock (no cache hit in between)
+        assert mock_run.call_count == 6

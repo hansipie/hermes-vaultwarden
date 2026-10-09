@@ -79,6 +79,9 @@ clears it from `config.yaml`.
 | `cache_ttl_seconds` | `300` | TTL for both cache layers; `0` disables caching entirely |
 | `binary_path` | — | Pin an exact `bw` binary path |
 | `timeout_seconds` | `120` | Orchestrator wall-clock budget around the fetch |
+| `self_heal` | `true` | Re-derive the session non-interactively when the stored token is dead |
+| `heal_password_file` | `~/.hermes/.env` | KEY=VALUE file with the heal credentials (password var, optional `BW_CLIENT_ID`/`BW_CLIENT_SECRET`/`BW_SERVER_URL`) |
+| `heal_password_var` | `BW_PASSWORD` | Key in `heal_password_file` holding the master password |
 
 Config keys are identical to the old in-tree PR #42300 branch — an
 existing config keeps working unchanged.
@@ -93,6 +96,24 @@ existing config keeps working unchanged.
   into, so unset means not exported. If a binding's target name also
   matches a custom field, the login/notes value wins and a warning is
   emitted.
+- **Self-heal**: Vaultwarden allows ONE live session per user, so any other
+  `bw unlock`/`login` (vault maintenance, a command-source helper, a stray
+  CLI call) silently invalidates the stored token and the next fetch comes
+  back empty ("bw returned no output"). With `self_heal: true` (default)
+  the source recovers on its own: it reads the master password from
+  `heal_password_file` (default `~/.hermes/.env` — the same file the
+  session token lives in, so one file holds the only secrets the plugin
+  needs), does a non-interactive API-key login when the file carries the
+  client-id/secret pair (CLI-native `BW_CLIENTID`/`BW_CLIENTSECRET`
+  env vars, `NODE_OPTIONS=--no-deprecation` to keep stdout clean, and
+  `BW_SERVER_URL` passed through when present), then
+  `bw unlock --passwordenv <var> --raw` — the password never touches argv.
+  The fresh token is written back to the `.env` line for `session_env`
+  (atomic, 0600), so the stored token stays warm for other readers. One
+  heal attempt per process; a heal failure degrades to the original empty
+  result (uncached, so it isn't masked by the TTL), and the whole heal is
+  best-effort — it never raises. Set `self_heal: false` to restore the
+  old "fail and print a warning" behaviour.
 - The session token env var is **protected** — a vault field named
   `BW_SESSION` can never overwrite the credential used to reach the vault.
 - **Timing**: plugin secret sources are discovered *after* the very
