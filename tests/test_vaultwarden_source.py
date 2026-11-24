@@ -229,6 +229,37 @@ class TestFetchVaultwardenSecrets:
                     home_path=tmp_path,
                 )
 
+    def test_locked_vault_prompt_raises_and_is_not_cached(self, tmp_path):
+        # Real bw behaviour with a stale session: prompts for the master
+        # password, readline dies on closed stdin, exit code is still 0.
+        proc = _make_fail_proc(
+            0,
+            "? Master password: [input is hidden]\n"
+            "Error [ERR_USE_AFTER_CLOSE]: readline was closed",
+        )
+        with mock.patch("subprocess.run", return_value=proc):
+            with pytest.raises(RuntimeError, match="vault is locked") as exc:
+                vw.fetch_vaultwarden_secrets(
+                    session=_FAKE_SESSION,
+                    item_name="Hermes",
+                    binary=Path("/usr/bin/bw"),
+                    use_cache=True,
+                    home_path=tmp_path,
+                )
+        assert vw._classify_bw_error(str(exc.value)) is ErrorKind.AUTH_EXPIRED
+        assert not vw._disk_cache_path(tmp_path).exists()
+
+    def test_empty_output_without_prompt_raises(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_fail_proc(0, "")):
+            with pytest.raises(RuntimeError, match="bw returned no output"):
+                vw.fetch_vaultwarden_secrets(
+                    session=_FAKE_SESSION,
+                    item_name="Hermes",
+                    binary=Path("/usr/bin/bw"),
+                    use_cache=False,
+                    home_path=tmp_path,
+                )
+
     def test_raises_when_bw_not_found(self, monkeypatch):
         monkeypatch.setattr(vw, "find_bw", lambda *a, **k: None)
         with pytest.raises(RuntimeError, match="bw binary not found"):
