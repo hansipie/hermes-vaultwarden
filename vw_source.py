@@ -429,7 +429,18 @@ def _run_bw_get_item(
 
     raw = (proc.stdout or "").strip()
     if not raw:
-        return {}, ["bw returned no output"]
+        # A locked vault / stale BW_SESSION makes bw prompt for the master
+        # password; with stdin on /dev/null its readline crashes yet bw
+        # still exits 0 with empty stdout.  Treat that as fatal (and never
+        # cache it) instead of a silent "no fields" warning.
+        err = scrub_ansi(proc.stderr or "").strip()
+        if "master password" in err.lower():
+            raise RuntimeError(
+                "vault is locked or the session token is stale — run "
+                "`bw unlock --raw` and update BW_SESSION"
+            )
+        detail = f": {err[:200]}" if err else ""
+        raise RuntimeError(f"bw returned no output{detail}")
 
     try:
         item = json.loads(raw)
@@ -581,6 +592,19 @@ class VaultwardenSource(SecretSource):
     label = "Vaultwarden"
     shape = "bulk"
     scheme = None
+    # Declaring the bootstrap credential lets Hermes treat BW_SESSION as the
+    # one token that unlocks every other secret: it is stripped from every
+    # spawned child (terminal tool, subprocesses) and can't be overwritten
+    # by a vault field.  bw itself still gets it via run_secret_cli's
+    # extra_env.  Hermes' child-env blocklist calls token_env({}), so only
+    # the default name is stripped there; a custom session_env stays
+    # protected from vault overwrites but not from child inheritance.
+    token_env_key = "session_env"
+    default_token_env = _DEFAULT_SESSION_ENV
+
+    def token_env(self, cfg: dict) -> str:
+        candidate = super().token_env(cfg)
+        return candidate if is_valid_env_name(candidate) else _DEFAULT_SESSION_ENV
 
     def protected_env_vars(self, cfg: dict):
         cfg = cfg if isinstance(cfg, dict) else {}
