@@ -369,14 +369,22 @@ class VaultwardenSource(SecretSource):
     label = "Vaultwarden"
     shape = "bulk"
     scheme = None
+    # Declaring the bootstrap credential lets Hermes treat BW_SESSION as the
+    # one token that unlocks every other secret: it is stripped from every
+    # spawned child (terminal tool, subprocesses) and can't be overwritten
+    # by a vault field.  bw itself still gets it via run_secret_cli's
+    # extra_env.  Hermes' child-env blocklist calls token_env({}), so only
+    # the default name is stripped there; a custom session_env stays
+    # protected from vault overwrites but not from child inheritance.
+    token_env_key = "session_env"
+    default_token_env = _DEFAULT_SESSION_ENV
+
+    def token_env(self, cfg: dict) -> str:
+        candidate = super().token_env(cfg)
+        return candidate if is_valid_env_name(candidate) else _DEFAULT_SESSION_ENV
 
     def protected_env_vars(self, cfg: dict):
-        session_env = _DEFAULT_SESSION_ENV
-        if isinstance(cfg, dict):
-            candidate = str(cfg.get("session_env") or session_env)
-            if is_valid_env_name(candidate):
-                session_env = candidate
-        return frozenset({session_env})
+        return frozenset({self.token_env(cfg)})
 
     def config_schema(self) -> dict:
         return {

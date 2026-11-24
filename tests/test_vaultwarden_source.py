@@ -556,6 +556,21 @@ class TestVaultwardenSourceFetch:
         assert "not a name" not in result.secrets
         assert any("not a valid" in w for w in result.warnings)
 
+    def test_token_env_declares_session_as_bootstrap_credential(self):
+        assert self.source.token_env({}) == "BW_SESSION"
+        assert self.source.token_env({"session_env": "MY_BW_TOKEN"}) == "MY_BW_TOKEN"
+        assert self.source.token_env({"session_env": "not a name"}) == "BW_SESSION"
+
+    def test_session_stripped_from_child_env(self, monkeypatch):
+        # Hermes builds its spawn blocklist from every registered source's
+        # token_env({}) — BW_SESSION must be in it once we're registered.
+        from tools.environments import local_env_policy
+
+        monkeypatch.setattr(
+            "agent.secret_sources.registry.list_sources", lambda: [self.source]
+        )
+        assert "BW_SESSION" in local_env_policy._secret_source_bootstrap_env()
+
     def test_protected_env_vars_follows_config(self):
         assert self.source.protected_env_vars({}) == frozenset({"BW_SESSION"})
         assert self.source.protected_env_vars(
