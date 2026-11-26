@@ -446,7 +446,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     enabled = bool(vw_cfg.get("enabled"))
     auto_unlock = bool(vw_cfg.get("auto_unlock"))
     session_env = vw_cfg.get("session_env", "BW_SESSION")
-    item_name = vw_cfg.get("item_id") or vw_cfg.get("item_name", "")
+    item_name, item_error = vw.resolve_item_name(vw_cfg)
+    item_raw = str(vw_cfg.get("item_id") or vw_cfg.get("item_name") or "").strip()
     session_set = bool(os.environ.get(session_env))
     plugin_enabled = "vaultwarden" in (
         (cfg.get("plugins") or {}).get("enabled") or []
@@ -463,7 +464,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("Auth mode",        "API key + auto-unlock" if auto_unlock else "session env")
     table.add_row("session_env",      session_env)
     table.add_row("session",          "[green]present[/green]" if session_set else "[dim]not supplied[/dim]")
-    table.add_row("item",             item_name or "[dim](unset)[/dim]")
+    if item_name and item_name != item_raw:
+        item_cell = f"{item_name} [dim](from {item_raw})[/dim]"
+    elif item_name:
+        item_cell = item_name
+    elif item_raw:
+        item_cell = f"[red]{item_raw} (unresolved)[/red]"
+    else:
+        item_cell = "[dim](unset)[/dim]"
+    table.add_row("item",             item_cell)
     table.add_row("username_env",     login_bindings["username_env"] or "[dim](unset)[/dim]")
     table.add_row("password_env",     login_bindings["password_env"] or "[dim](unset)[/dim]")
     table.add_row("notes_env",        login_bindings["notes_env"] or "[dim](unset)[/dim]")
@@ -505,8 +514,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             "Vaultwarden and warn on next startup.[/yellow]\n"
             "  Unlock: [cyan]export BW_SESSION=$(bw unlock --raw)[/cyan]"
         )
-    elif not item_name:
-        console.print("\n  [yellow]Enabled but no item_name configured.[/yellow]")
+    elif item_error:
+        console.print(f"\n  [yellow]Enabled but {item_error}[/yellow]")
     return 0
 
 
@@ -523,9 +532,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     session_env = vw_cfg.get("session_env", "BW_SESSION")
 
-    item_name = vw_cfg.get("item_id") or vw_cfg.get("item_name", "")
-    if not item_name:
-        console.print("[red]No item_name configured.[/red]")
+    # Same resolution as fetch(): item_id first, ${VAR} refs expanded.
+    _item_name, item_error = vw.resolve_item_name(vw_cfg)
+    if item_error:
+        console.print(f"[red]{item_error}[/red]")
         return 1
 
     binary = vw.find_bw(vw_cfg.get("binary_path"))

@@ -207,6 +207,51 @@ def test_sync_auto_unlock_mints_once_and_ignores_env_session(monkeypatch, tmp_pa
     assert "NEW_KEY" not in cli.os.environ  # dry-run writes nothing
 
 
+def test_sync_expands_item_name_ref(monkeypatch, tmp_path):
+    config = {
+        "secrets": {
+            "vaultwarden": {
+                "enabled": True,
+                "item_name": "${BW_ITEM_NAME}",
+                "binary_path": "/usr/local/bin/bw",
+            }
+        }
+    }
+    item = {"fields": [{"name": "NEW_KEY", "value": "new-value", "type": 1}]}
+    _configure_sync(monkeypatch, tmp_path, config, item)
+    calls = []
+    monkeypatch.setattr(
+        vw,
+        "run_secret_cli",
+        lambda argv, **k: calls.append(list(argv)) or _proc(stdout=json.dumps(item)),
+    )
+    monkeypatch.setenv("BW_SESSION", _SESSION)
+    monkeypatch.setenv("BW_ITEM_NAME", "Hermes")
+    monkeypatch.delenv("NEW_KEY", raising=False)
+
+    assert cli.cmd_sync(argparse.Namespace(apply=False)) == 0
+    get_item = [argv for argv in calls if argv[1:3] == ["get", "item"]]
+    assert get_item and get_item[0][3] == "Hermes"
+
+
+def test_sync_reports_unset_item_ref(monkeypatch, tmp_path, capsys):
+    config = {
+        "secrets": {
+            "vaultwarden": {
+                "enabled": True,
+                "item_name": "${BW_ITEM_NAME}",
+                "binary_path": "/usr/local/bin/bw",
+            }
+        }
+    }
+    _configure_sync(monkeypatch, tmp_path, config, {})
+    monkeypatch.setenv("BW_SESSION", _SESSION)
+    monkeypatch.delenv("BW_ITEM_NAME", raising=False)
+
+    assert cli.cmd_sync(argparse.Namespace(apply=False)) == 1
+    assert "BW_ITEM_NAME" in capsys.readouterr().out
+
+
 def _configure_sync(monkeypatch, tmp_path, config, item):
     monkeypatch.setattr(cli, "load_config", lambda: config)
     monkeypatch.setattr(cli, "get_hermes_home", lambda: tmp_path)

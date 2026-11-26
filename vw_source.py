@@ -52,6 +52,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -60,6 +61,7 @@ from agent.secret_sources._cache import CachedFetch, DiskCache, resolve_cache_ho
 from agent.secret_sources.base import (
     ErrorKind,
     FetchResult,
+    get_source_environment,
     SecretSource,
     get_source_environment,
     is_valid_env_name,
@@ -83,6 +85,101 @@ _DEFAULT_MASTER_PASSWORD_ENV = "BW_MASTER_PASSWORD"
 # the isolated profile dir through ``extra_env``, which overrides the
 # inherited value.  Neither path is secret.
 _BW_ALLOW_ENV = ("NODE_EXTRA_CA_CERTS", "BITWARDENCLI_APPDATA_DIR")
+
+# ---------------------------------------------------------------------------
+# Config ${VAR} / ${env:VAR} expansion (plugin-side, mirrors hermes_cli/config.py)
+# ---------------------------------------------------------------------------
+# Core intentionally reads the ``secrets:`` section RAW (_load_secrets_config →
+# read_raw_config; no _expand_env_vars on that path), and core's own expander
+# only handles the env shape ("external backends inject their values into the
+# environment at startup, so a config ref only ever needs the env shape"). The
+# bulk Vaultwarden source must therefore do the same expansion itself or a
+# config like ``item_name: ${BW_ITEM_NAME}`` reaches `bw get item` as a
+# literal template (observed: "bw exited 1: Not found." twice per boot).
+_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _env_ref_var_name(inner: str) -> Optional[str]:
+    """Var name for ``${VAR}`` (bare name) or ``${env:VAR}``; None otherwise."""
+    inner = inner.strip()
+    if inner.startswith("env:"):
+        inner = inner[4:].strip()
+    return inner if inner.isidentifier() else None
+
+
+def _env_ref_lookup(name: str) -> Optional[str]:
+    """Resolve an env var for a config ref from the source environment.
+
+    ``get_source_environment()`` is the per-fetch view (apply_all's
+    ``environ``) when one is active and ``os.environ`` otherwise.  There is
+    deliberately no fallback to ``os.environ`` when the per-fetch view lacks
+    the var: in multiplex mode that would pick up another profile's value.
+    """
+    return get_source_environment().get(name)
+
+
+def _expand_env_refs_tracked(value: str) -> Tuple[str, List[str]]:
+    """Expand ``${VAR}``/``${env:VAR}`` and report the names left unresolved.
+
+    Unresolved refs stay verbatim (same policy as core's _expand_env_vars).
+    Non-env refs such as ``${file:…}`` are left untouched and are not
+    reported, and a resolved value that itself contains ``${`` is kept as is.
+    """
+    missing: List[str] = []
+
+    def _sub(m: "re.Match[str]") -> str:
+        name = _env_ref_var_name(m.group(1))
+        if name is None:
+            return m.group(0)
+        val = _env_ref_lookup(name)
+        if val is None:
+            if name not in missing:
+                missing.append(name)
+            return m.group(0)
+        return val
+
+    return _ENV_REF_RE.sub(_sub, value), missing
+
+
+def _expand_env_refs(value: str) -> str:
+    """Expand ``${VAR}``/``${env:VAR}``; unresolved refs stay verbatim."""
+    return _expand_env_refs_tracked(value)[0]
+
+
+def resolve_item_name(cfg: dict) -> Tuple[str, Optional[str]]:
+    """Return ``(item_ref, error)`` for the configured vault item.
+
+    ``item_id`` wins over ``item_name``.  ``${VAR}``/``${env:VAR}`` refs are
+    expanded because the ``secrets:`` section reaches the plugin raw.  On
+    failure ``item_ref`` is empty and ``error`` says what is wrong, naming
+    the unset variables.  Shared by :meth:`VaultwardenSource.fetch` and the
+    ``hermes vaultwarden`` CLI so both resolve the same item.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    key = "item_id" if str(cfg.get("item_id") or "").strip() else "item_name"
+    raw = str(cfg.get(key) or "").strip()
+    if not raw:
+        return "", (
+            "secrets.vaultwarden.item_id/item_name is empty.  "
+            "Run `hermes vaultwarden setup`."
+        )
+    expanded, missing = _expand_env_refs_tracked(raw)
+    if missing:
+        refs = ", ".join("${" + name + "}" for name in missing)
+        verb = "is" if len(missing) == 1 else "are"
+        return "", (
+            f"secrets.vaultwarden.{key} references {refs}, which {verb} not set.  "
+            "Set it in the environment (envdir/.env) or run "
+            "`hermes vaultwarden setup`."
+        )
+    expanded = expanded.strip()
+    if not expanded:
+        return "", (
+            f"secrets.vaultwarden.{key} expands to an empty value.  "
+            "Run `hermes vaultwarden setup`."
+        )
+    return expanded, None
+
 
 _CacheKey = Tuple[str, str, str, str, str, str]
 # (resolved_home, session_fingerprint, item_name,
@@ -662,7 +759,11 @@ class VaultwardenSource(SecretSource):
                 "default": "",
             },
             "item_name": {
-                "description": "Vault item whose custom fields become env vars",
+                "description": (
+                    "Vault item whose custom fields become env vars.  "
+                    "${VAR} / ${env:VAR} references are expanded from the "
+                    "source environment (envdir/.env/process env)."
+                ),
                 "default": "",
             },
             "username_env": {
@@ -769,12 +870,9 @@ class VaultwardenSource(SecretSource):
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
 
-        item_name = str(cfg.get("item_id") or cfg.get("item_name") or "").strip()
-        if not item_name:
-            result.error = (
-                "secrets.vaultwarden.item_id/item_name is empty.  "
-                "Run `hermes vaultwarden setup`."
-            )
+        item_name, item_error = resolve_item_name(cfg)
+        if item_error:
+            result.error = item_error
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
 
