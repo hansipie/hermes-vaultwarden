@@ -23,7 +23,8 @@ from typing import List, Optional
 
 from agent.secret_sources import registry as secret_registry
 from agent.secret_sources.base import is_valid_env_name, run_secret_cli
-from hermes_cli.config import load_config, save_config
+from hermes_cli.config import get_env_path, load_config, save_config, save_env_value
+from hermes_cli.secret_prompt import masked_secret_prompt
 from hermes_constants import get_hermes_home
 from rich.console import Console
 from rich.panel import Panel
@@ -52,6 +53,13 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
     setup.add_argument(
         "--item-name",
         help="Vault item name to read secrets from (skips interactive prompt)",
+    )
+    setup.add_argument(
+        "--session",
+        help=(
+            "Provide the BW_SESSION token non-interactively "
+            "(session mode only; stored in .env)"
+        ),
     )
     setup.add_argument(
         "--binary-path",
@@ -160,8 +168,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # -- non-interactive guard --
     if not sys.stdin.isatty():
         missing = []
-        if not args.auto_unlock and not os.environ.get("BW_SESSION", "").strip():
-            missing.append("BW_SESSION or --auto-unlock")
+        session_env0 = secrets_cfg.get("session_env", "BW_SESSION")
+        if not args.auto_unlock and not (
+            (args.session or "").strip() or os.environ.get(session_env0, "").strip()
+        ):
+            missing.append(f"--session (or {session_env0}) or --auto-unlock")
         if args.auto_unlock and not (args.server_url and args.server_url.strip()):
             missing.append("--server-url")
         if not ((args.item_id and args.item_id.strip()) or (args.item_name and args.item_name.strip())):
@@ -173,6 +184,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 "  Usage:\n"
                 "    hermes vaultwarden setup --auto-unlock \\\n"
                 "      --server-url https://vault.example.com \\\n"
+                "      --item-id '<vault-item-id>'\n"
+                "  or:\n"
+                "    hermes vaultwarden setup --session '<bw-session-token>' \\\n"
                 "      --item-id '<vault-item-id>'"
             )
             return 1
@@ -208,7 +222,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     console.print("[bold]Step 3[/bold]  Authenticate")
     session_env = secrets_cfg.get("session_env", "BW_SESSION")
 
-    session = os.environ.get(session_env, "").strip()
+    session = ""
     appdata_dir = None
     if args.auto_unlock:
         try:
@@ -222,14 +236,23 @@ def cmd_setup(args: argparse.Namespace) -> int:
             console.print(f"  [red]Unattended authentication failed: {exc}[/red]")
             return 1
         console.print("  [green]✓[/green] API-key login and in-memory unlock succeeded")
-    elif session:
-        console.print(f"  [green]✓[/green] using {session_env} from the process environment")
     else:
-        console.print(
-            f"  [red]{session_env} is not set.[/red] Export the output of "
-            "[cyan]bw unlock --raw[/cyan], or re-run with [cyan]--auto-unlock[/cyan]."
-        )
-        return 1
+        session = (args.session or "").strip() or os.environ.get(session_env, "").strip()
+        if not session:
+            console.print(
+                "  Obtain it with: [cyan]export BW_SESSION=$(bw unlock --raw)[/cyan]"
+            )
+            session = masked_secret_prompt(
+                f"  Paste session token ({session_env}): "
+            ).strip()
+        if not session:
+            console.print("  [red]Empty session token, aborting.[/red]")
+            return 1
+        # Session mode: the gateway and later processes read the token from
+        # .env, exactly as before auto_unlock existed.
+        save_env_value(session_env, session)
+        os.environ[session_env] = session
+        console.print(f"  [green]✓[/green] stored in {get_env_path()} as {session_env}")
 
     # ------------------------------------------------------------------ item
     console.print()
@@ -359,17 +382,22 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # ------------------------------------------------------------------ save
     secrets_cfg["enabled"] = True
+    # item_id outranks item_name at fetch time, so the reference not chosen
+    # now must be dropped or a stale one would keep winning.
     if item_id:
         secrets_cfg["item_id"] = item_id
         secrets_cfg.pop("item_name", None)
     else:
         secrets_cfg["item_name"] = item_name
+        secrets_cfg.pop("item_id", None)
     secrets_cfg["auto_unlock"] = bool(args.auto_unlock)
     if server_url:
         secrets_cfg["server_url"] = server_url
     secrets_cfg.setdefault("session_env", session_env)
     secrets_cfg.setdefault("cache_ttl_seconds", 0)
-    secrets_cfg.setdefault("override_existing", False)
+    # Session-mode setups keep the historical default (vault wins over .env);
+    # unattended setups default to not overriding.
+    secrets_cfg.setdefault("override_existing", not args.auto_unlock)
     if requested_binary:
         secrets_cfg["binary_path"] = str(binary)
 
@@ -400,10 +428,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
     console.print(
         "  Status:  [cyan]hermes vaultwarden status[/cyan]\n"
         "  Refresh: [cyan]hermes vaultwarden sync[/cyan]\n"
-        "  Disable: [cyan]hermes vaultwarden disable[/cyan]\n\n"
-        "  Auto-unlock sessions are minted in memory for each Hermes process and "
-        "are never written to config or .env."
+        "  Disable: [cyan]hermes vaultwarden disable[/cyan]"
     )
+    if args.auto_unlock:
+        console.print(
+            "\n  Auto-unlock sessions are minted in memory for each Hermes process "
+            "and are never written to config or .env."
+        )
     return 0
 
 
@@ -502,21 +533,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
         console.print("[red]bw binary not found.[/red]")
         return 1
 
+    # In auto_unlock mode fetch() mints the session itself (and ignores any
+    # env token); minting here too would unlock twice per command.
+    auto_unlock = bool(vw_cfg.get("auto_unlock"))
     session = os.environ.get(session_env, "").strip()
-    if not session and vw_cfg.get("auto_unlock"):
-        try:
-            session = vw.mint_session(
-                binary,
-                home_path=get_hermes_home(),
-                client_id_env=str(vw_cfg.get("client_id_env") or "BW_CLIENTID"),
-                client_secret_env=str(vw_cfg.get("client_secret_env") or "BW_CLIENTSECRET"),
-                master_password_env=str(vw_cfg.get("master_password_env") or "BW_MASTER_PASSWORD"),
-                server_url=str(vw_cfg.get("server_url") or ""),
-            )
-        except RuntimeError as exc:
-            console.print(f"[red]Authentication failed: {exc}[/red]")
-            return 1
-    if not session:
+    if not session and not auto_unlock:
         console.print(f"[red]{session_env} is not set.[/red]")
         return 1
 
@@ -533,7 +554,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
     orchestrated_vw_cfg["cache_ttl_seconds"] = 0
     orchestrated_cfg["vaultwarden"] = orchestrated_vw_cfg
     staged_env = dict(os.environ)
-    staged_env[session_env] = session
     report = secret_registry.apply_all(
         orchestrated_cfg,
         get_hermes_home(),

@@ -29,6 +29,7 @@ def _setup_args(**overrides) -> argparse.Namespace:
     values = {
         "binary_path": None,
         "auto_unlock": False,
+        "session": None,
         "item_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         "item_name": None,
         "server_url": None,
@@ -81,6 +82,129 @@ def test_interactive_setup_rejects_server_mismatch_before_fetch(monkeypatch):
     assert result == 1
     fetch.assert_not_called()
     save.assert_not_called()
+
+
+def _configure_setup(monkeypatch, config):
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(vw, "find_bw", lambda *_: Path("/usr/local/bin/bw"))
+    monkeypatch.setattr(cli, "_bw_version", lambda *_: "2026.8.0")
+    monkeypatch.setattr(cli, "_bw_current_server", lambda *_a, **_k: "")
+    monkeypatch.setattr(cli.sys, "stdin", mock.MagicMock(isatty=lambda: False))
+    monkeypatch.setattr(
+        vw, "fetch_vaultwarden_secrets", mock.Mock(return_value=({}, []))
+    )
+    save_env = mock.Mock()
+    monkeypatch.setattr(cli, "save_env_value", save_env)
+    monkeypatch.setattr(cli, "get_env_path", lambda: Path("/tmp/.env"))
+    monkeypatch.setattr(cli, "save_config", mock.Mock())
+    return save_env
+
+
+def test_setup_session_flag_is_saved_to_env(monkeypatch):
+    config = {"secrets": {"vaultwarden": {}}}
+    # setenv first so monkeypatch restores BW_SESSION after setup writes it
+    monkeypatch.setenv("BW_SESSION", "")
+    monkeypatch.delenv("BW_SESSION")
+    save_env = _configure_setup(monkeypatch, config)
+
+    assert cli.cmd_setup(_setup_args(session=_SESSION)) == 0
+
+    save_env.assert_called_once_with("BW_SESSION", _SESSION)
+    assert cli.os.environ["BW_SESSION"] == _SESSION
+    vw_cfg = config["secrets"]["vaultwarden"]
+    assert vw_cfg["override_existing"] is True
+    assert vw_cfg["auto_unlock"] is False
+
+
+def test_setup_prompts_for_session_when_missing(monkeypatch):
+    config = {"secrets": {"vaultwarden": {}}}
+    # setenv first so monkeypatch restores BW_SESSION after setup writes it
+    monkeypatch.setenv("BW_SESSION", "")
+    monkeypatch.delenv("BW_SESSION")
+    save_env = _configure_setup(monkeypatch, config)
+    monkeypatch.setattr(cli.sys, "stdin", mock.MagicMock(isatty=lambda: True))
+    prompt = mock.Mock(return_value=f"  {_SESSION}  ")
+    monkeypatch.setattr(cli, "masked_secret_prompt", prompt)
+    # later binding prompts: answer blank (skip)
+    monkeypatch.setattr(cli.Console, "input", lambda *_a, **_k: "")
+
+    assert cli.cmd_setup(_setup_args()) == 0
+
+    prompt.assert_called_once()
+    save_env.assert_called_once_with("BW_SESSION", _SESSION)
+
+
+def test_setup_auto_unlock_does_not_persist_session(monkeypatch, tmp_path):
+    config = {"secrets": {"vaultwarden": {}}}
+    save_env = _configure_setup(monkeypatch, config)
+    monkeypatch.setattr(cli, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(vw, "mint_session", mock.Mock(return_value="minted"))
+
+    result = cli.cmd_setup(
+        _setup_args(auto_unlock=True, server_url="https://vault.example.com")
+    )
+
+    assert result == 0
+    save_env.assert_not_called()
+    vw_cfg = config["secrets"]["vaultwarden"]
+    assert vw_cfg["override_existing"] is False
+    assert vw_cfg["auto_unlock"] is True
+
+
+def test_setup_item_name_clears_stale_item_id(monkeypatch):
+    config = {
+        "secrets": {
+            "vaultwarden": {"item_id": "old-id-0000", "override_existing": False}
+        }
+    }
+    monkeypatch.setenv("BW_SESSION", _SESSION)
+    _configure_setup(monkeypatch, config)
+
+    assert cli.cmd_setup(_setup_args(item_id=None, item_name="Hermes")) == 0
+
+    vw_cfg = config["secrets"]["vaultwarden"]
+    assert vw_cfg["item_name"] == "Hermes"
+    assert "item_id" not in vw_cfg
+    # an existing explicit choice is preserved
+    assert vw_cfg["override_existing"] is False
+
+
+def test_setup_item_id_clears_item_name(monkeypatch):
+    config = {"secrets": {"vaultwarden": {"item_name": "Old"}}}
+    monkeypatch.setenv("BW_SESSION", _SESSION)
+    _configure_setup(monkeypatch, config)
+
+    assert cli.cmd_setup(_setup_args(item_id="new-id-1111")) == 0
+
+    vw_cfg = config["secrets"]["vaultwarden"]
+    assert vw_cfg["item_id"] == "new-id-1111"
+    assert "item_name" not in vw_cfg
+
+
+def test_sync_auto_unlock_mints_once_and_ignores_env_session(monkeypatch, tmp_path):
+    config = {
+        "secrets": {
+            "vaultwarden": {
+                "enabled": True,
+                "item_name": "Hermes",
+                "auto_unlock": True,
+                "server_url": "https://vault.example.com",
+                "binary_path": "/usr/local/bin/bw",
+            }
+        }
+    }
+    item = {"fields": [{"name": "NEW_KEY", "value": "new-value", "type": 1}]}
+    _configure_sync(monkeypatch, tmp_path, config, item)
+    monkeypatch.setenv("BW_SESSION", "stale-env-session")
+    monkeypatch.delenv("NEW_KEY", raising=False)
+    mint = mock.Mock(return_value="minted-session")
+    monkeypatch.setattr(vw, "mint_session", mint)
+
+    result = cli.cmd_sync(argparse.Namespace(apply=False))
+
+    assert result == 0
+    mint.assert_called_once()
+    assert "NEW_KEY" not in cli.os.environ  # dry-run writes nothing
 
 
 def _configure_sync(monkeypatch, tmp_path, config, item):
