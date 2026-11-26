@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from tests.secret_sources.conformance import SecretSourceConformance
 
 from vw_source import VaultwardenSource
