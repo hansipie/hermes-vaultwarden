@@ -36,7 +36,8 @@ snap, or the native binary from https://bitwarden.com/help/cli/.
 ### Unattended services (recommended)
 
 Create a **personal API key** for the dedicated Bitwarden/Vaultwarden account.
-This is not a Bitwarden Secrets Manager organization access token. Supply the
+This is not a Bitwarden Secrets Manager organization access token (see the
+[FAQ](FAQ.md) if `bw login --apikey` rejects it). Supply the
 three bootstrap values to the Hermes process without writing them to
 `config.yaml`:
 
