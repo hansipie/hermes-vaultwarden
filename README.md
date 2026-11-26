@@ -121,7 +121,7 @@ clears it from `config.yaml`.
 | `master_password_env` | `BW_MASTER_PASSWORD` | Name of the master-password env var |
 | `server_url` | — | Vaultwarden URL used by this profile's isolated CLI state |
 | `item_id` | — | Immutable vault item UUID (preferred; wins over `item_name`) |
-| `item_name` | — | Vault item whose custom fields become env vars; `setup` stores only one of the two |
+| `item_name` | — | Vault item whose custom fields become env vars; `setup` stores only one of the two. Both accept `${VAR}` / `${env:VAR}` refs, resolved from the Hermes environment |
 | `username_env` | — | Env var for `login.username`; unset = not exported |
 | `password_env` | — | Env var for `login.password`; unset = not exported |
 | `notes_env` | — | Env var for the item's `notes`; unset = not exported |

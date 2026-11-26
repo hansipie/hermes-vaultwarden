@@ -1152,9 +1152,50 @@ class TestItemNameEnvExpansion:
                 {"enabled": True, "item_name": "${BW_ITEM_NAME}"}, tmp_path
             )
         assert not result.ok
-        assert "unresolved" in result.error
+        assert "item_name references ${BW_ITEM_NAME}, which is not set" in result.error
         assert result.error_kind is ErrorKind.NOT_CONFIGURED
         mock_run.assert_not_called()  # never passes the literal template to bw
+
+    def test_per_fetch_environment_wins_and_has_no_os_environ_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        # Multiplex mode: the per-fetch view is authoritative.  A value only
+        # present in os.environ (another profile's) must not leak in.
+        from agent.secret_sources.base import (
+            reset_source_environment,
+            set_source_environment,
+        )
+
+        monkeypatch.setenv("BW_ITEM_NAME", "OtherProfile")
+        monkeypatch.setenv("BW_ONLY_IN_PROCESS", "Leaked")
+        token = set_source_environment({"BW_ITEM_NAME": "ThisProfile"})
+        try:
+            assert vw.resolve_item_name({"item_name": "${BW_ITEM_NAME}"}) == (
+                "ThisProfile", None,
+            )
+            item, error = vw.resolve_item_name({"item_name": "${BW_ONLY_IN_PROCESS}"})
+        finally:
+            reset_source_environment(token)
+        assert item == ""
+        assert "${BW_ONLY_IN_PROCESS}" in error
+
+    def test_resolved_value_containing_template_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("BW_ITEM_NAME", "Hermes ${literal}")
+        assert vw.resolve_item_name({"item_name": "${BW_ITEM_NAME}"}) == (
+            "Hermes ${literal}", None,
+        )
+
+    def test_non_env_ref_is_not_rejected(self):
+        assert vw.resolve_item_name({"item_name": "${file:/etc/x}"}) == (
+            "${file:/etc/x}", None,
+        )
+
+    def test_reports_every_missing_variable(self, monkeypatch):
+        monkeypatch.delenv("BW_A", raising=False)
+        monkeypatch.delenv("BW_B", raising=False)
+        item, error = vw.resolve_item_name({"item_id": "${BW_A}-${env:BW_B}"})
+        assert item == ""
+        assert "item_id references ${BW_A}, ${BW_B}, which are not set" in error
 
     def test_expansion_helper_mirrors_core_semantics(self, monkeypatch):
         monkeypatch.setenv("FOO", "bar")

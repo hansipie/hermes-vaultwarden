@@ -108,26 +108,77 @@ def _env_ref_var_name(inner: str) -> Optional[str]:
 
 
 def _env_ref_lookup(name: str) -> Optional[str]:
-    """Resolve an env var for a config ref: the per-fetch source environment
-    view (apply_all's ``environ`` — envdir + .env + .op.env merged) first, then
-    the process environment. Mirrors core's scope-aware _env_ref_lookup."""
-    source_env = get_source_environment()
-    val = source_env.get(name) if source_env is not None else None
-    if val is None:
-        val = os.environ.get(name)
-    return val
+    """Resolve an env var for a config ref from the source environment.
+
+    ``get_source_environment()`` is the per-fetch view (apply_all's
+    ``environ``) when one is active and ``os.environ`` otherwise.  There is
+    deliberately no fallback to ``os.environ`` when the per-fetch view lacks
+    the var: in multiplex mode that would pick up another profile's value.
+    """
+    return get_source_environment().get(name)
 
 
-def _expand_env_refs(value: str) -> str:
-    """Expand ``${VAR}``/``${env:VAR}``; unresolved stay verbatim (same policy
-    as core's _expand_env_vars) so callers can detect them."""
+def _expand_env_refs_tracked(value: str) -> Tuple[str, List[str]]:
+    """Expand ``${VAR}``/``${env:VAR}`` and report the names left unresolved.
+
+    Unresolved refs stay verbatim (same policy as core's _expand_env_vars).
+    Non-env refs such as ``${file:…}`` are left untouched and are not
+    reported, and a resolved value that itself contains ``${`` is kept as is.
+    """
+    missing: List[str] = []
+
     def _sub(m: "re.Match[str]") -> str:
         name = _env_ref_var_name(m.group(1))
         if name is None:
             return m.group(0)
         val = _env_ref_lookup(name)
-        return val if val is not None else m.group(0)
-    return _ENV_REF_RE.sub(_sub, value)
+        if val is None:
+            if name not in missing:
+                missing.append(name)
+            return m.group(0)
+        return val
+
+    return _ENV_REF_RE.sub(_sub, value), missing
+
+
+def _expand_env_refs(value: str) -> str:
+    """Expand ``${VAR}``/``${env:VAR}``; unresolved refs stay verbatim."""
+    return _expand_env_refs_tracked(value)[0]
+
+
+def resolve_item_name(cfg: dict) -> Tuple[str, Optional[str]]:
+    """Return ``(item_ref, error)`` for the configured vault item.
+
+    ``item_id`` wins over ``item_name``.  ``${VAR}``/``${env:VAR}`` refs are
+    expanded because the ``secrets:`` section reaches the plugin raw.  On
+    failure ``item_ref`` is empty and ``error`` says what is wrong, naming
+    the unset variables.  Shared by :meth:`VaultwardenSource.fetch` and the
+    ``hermes vaultwarden`` CLI so both resolve the same item.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    key = "item_id" if str(cfg.get("item_id") or "").strip() else "item_name"
+    raw = str(cfg.get(key) or "").strip()
+    if not raw:
+        return "", (
+            "secrets.vaultwarden.item_id/item_name is empty.  "
+            "Run `hermes vaultwarden setup`."
+        )
+    expanded, missing = _expand_env_refs_tracked(raw)
+    if missing:
+        refs = ", ".join("${" + name + "}" for name in missing)
+        verb = "is" if len(missing) == 1 else "are"
+        return "", (
+            f"secrets.vaultwarden.{key} references {refs}, which {verb} not set.  "
+            "Set it in the environment (envdir/.env) or run "
+            "`hermes vaultwarden setup`."
+        )
+    expanded = expanded.strip()
+    if not expanded:
+        return "", (
+            f"secrets.vaultwarden.{key} expands to an empty value.  "
+            "Run `hermes vaultwarden setup`."
+        )
+    return expanded, None
 
 
 _CacheKey = Tuple[str, str, str, str, str, str]
@@ -819,26 +870,10 @@ class VaultwardenSource(SecretSource):
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
 
-        item_name = _expand_env_refs(
-            str(cfg.get("item_id") or cfg.get("item_name") or "").strip()
-        ).strip()
-        if not item_name or _ENV_REF_RE.search(item_name):
-            result.error = (
-                "secrets.vaultwarden.item_id/item_name is empty or contains an "
-                "unresolved ${VAR} reference.  Set the variable in the environment "
-                "(envdir/.env) or run `hermes vaultwarden setup`."
-            )
+        item_name, item_error = resolve_item_name(cfg)
+        if item_error:
+            result.error = item_error
             result.error_kind = ErrorKind.NOT_CONFIGURED
-            return result
-
-        binary = find_bw(cfg.get("binary_path"))
-        result.binary_path = binary
-        if binary is None:
-            result.error = (
-                "bw binary not found.  Install it from your package manager or "
-                "https://github.com/bitwarden/clients/releases"
-            )
-            result.error_kind = ErrorKind.BINARY_MISSING
             return result
 
         binary = find_bw(cfg.get("binary_path"))
