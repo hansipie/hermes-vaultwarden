@@ -51,7 +51,9 @@ hermes vaultwarden setup --auto-unlock \
 
 At startup the plugin checks the CLI state, logs in with `bw login --apikey`
 only when unauthenticated, and unlocks with `bw unlock --passwordenv … --raw`.
-The session token remains in process memory. Each Hermes profile gets isolated
+The session token remains in process memory; any `BW_SESSION` already present
+in the environment is ignored in this mode (with a warning), since it was not
+issued for the isolated CLI state. Each Hermes profile gets isolated
 CLI state under `$HERMES_HOME/plugin-data/vaultwarden/bw-cli`, so profiles do
 not share login state.
 
@@ -81,8 +83,12 @@ export BW_SESSION=$(bw unlock --raw)
 hermes vaultwarden setup --item-id '<vault-item-uuid>'
 ```
 
-The setup command reads `BW_SESSION` from its environment but never accepts a
-session on the command line and never persists it.
+The setup command takes the token from `--session`, then `BW_SESSION`, and
+otherwise prompts for it (hidden input). In this mode the token is stored in
+the Hermes `.env` so the gateway and later processes can use it, and
+`override_existing` defaults to `true` (vault values win over `.env`), as
+before auto-unlock existed. `bw` honours a relocated `BITWARDENCLI_APPDATA_DIR`
+in this mode.
 
 Secrets are read from **one vault item's custom fields** — name each
 field after the env var it should set (e.g. `OPENROUTER_API_KEY`).
@@ -109,17 +115,17 @@ clears it from `config.yaml`.
 |---|---|---|
 | `enabled` | `false` | Master switch |
 | `session_env` | `BW_SESSION` | Env var holding the `bw unlock --raw` token |
-| `auto_unlock` | `false` | Mint a memory-only session from personal API-key credentials |
+| `auto_unlock` | `false` | Mint a memory-only session from personal API-key credentials (`session_env` is then ignored) |
 | `client_id_env` | `BW_CLIENTID` | Name of the personal API-key client-ID env var |
 | `client_secret_env` | `BW_CLIENTSECRET` | Name of the personal API-key client-secret env var |
 | `master_password_env` | `BW_MASTER_PASSWORD` | Name of the master-password env var |
 | `server_url` | — | Vaultwarden URL used by this profile's isolated CLI state |
-| `item_id` | — | Immutable vault item UUID (preferred) |
-| `item_name` | — | Vault item whose custom fields become env vars |
+| `item_id` | — | Immutable vault item UUID (preferred; wins over `item_name`) |
+| `item_name` | — | Vault item whose custom fields become env vars; `setup` stores only one of the two |
 | `username_env` | — | Env var for `login.username`; unset = not exported |
 | `password_env` | — | Env var for `login.password`; unset = not exported |
 | `notes_env` | — | Env var for the item's `notes`; unset = not exported |
-| `override_existing` | `false` | Overwrite vars already set by `.env`/shell (never another secret source) |
+| `override_existing` | `false` (setup writes `true` in session mode) | Overwrite vars already set by `.env`/shell (never another secret source) |
 | `cache_ttl_seconds` | `0` | Plaintext cache TTL; disabled by default |
 | `binary_path` | — | Pin an exact `bw` binary path |
 | `timeout_seconds` | `120` | Orchestrator wall-clock budget around the fetch |
@@ -156,13 +162,6 @@ setup to migrate to unattended authentication and immutable `item_id` lookup.
   in-process cache plus `$HERMES_HOME/cache/vaultwarden_cache.json` (atomic
   mode `0600`, keyed on a session fingerprint; the token itself is not
   written).
-
-## License status
-
-The upstream repository currently declares no license. That means the code is
-source-visible but does not presently grant general permission to copy,
-modify, or redistribute it. Contributors and adopters should ask the upstream
-maintainer to add an explicit license.
 
 ## Tests
 
