@@ -126,6 +126,7 @@ clears it from `config.yaml`.
 | `password_env` | — | Env var for `login.password`; unset = not exported |
 | `notes_env` | — | Env var for the item's `notes`; unset = not exported |
 | `override_existing` | `false` (setup writes `true` in session mode) | Overwrite vars already set by `.env`/shell (never another secret source) |
+| `sync_interval_seconds` | `300` | Skip the network `bw sync` when the CLI state synced less than this ago; `0` syncs on every fetch |
 | `cache_ttl_seconds` | `0` | Plaintext cache TTL; disabled by default |
 | `binary_path` | — | Pin an exact `bw` binary path |
 | `timeout_seconds` | `120` | Orchestrator wall-clock budget around the fetch |
@@ -145,16 +146,30 @@ setup to migrate to unattended authentication and immutable `item_id` lookup.
   emitted.
 - Bootstrap variables are **protected** — vault fields cannot overwrite the
   session, API-key, or master-password variables used to reach the vault.
+- **Child processes**: Hermes strips `BW_SESSION` from every spawned child
+  (terminal tool, subprocesses). It strips `BW_CLIENTSECRET` and
+  `BW_MASTER_PASSWORD` too, because `setup --auto-unlock` writes
+  `client_secret_env` / `master_password_env` into `config.yaml` (Hermes
+  withholds any var a `*_secret_env` / `*_password_env` field names). If
+  those fields are missing, `fetch` and `status` warn. `BW_CLIENTID` is an
+  identifier, not a secret, and is not stripped.
+- The master password is passed to `bw unlock --passwordenv` verbatim;
+  leading or trailing spaces are kept.
 - Empty custom-field values are skipped with a warning, so an empty vault
   field cannot erase a working credential even when overrides are enabled.
 - Item names and IDs beginning with `-` are rejected because current `bw`
   treats them as options and rejects the usual `--` option terminator.
 - Current Hermes re-runs secret-source loading after plugin discovery, so a
   newly discovered plugin can contribute secrets to the same invocation.
-- On every cache miss, the plugin runs native `bw sync` before `bw get item`.
-  A failed sync fails the source fetch rather than applying stale local-vault
-  data. A positive plaintext cache TTL intentionally defers both operations
-  until that cache entry expires; the default TTL is zero.
+- On a cache miss, the plugin runs native `bw sync` before `bw get item`,
+  unless the CLI state synced less than `sync_interval_seconds` ago (300 s by
+  default, read locally from `bw status`). A repeated startup or the
+  post-discovery reload therefore skips the network round-trip, and local
+  data is never older than that interval. A failed sync fails the source
+  fetch rather than applying stale local-vault data, so a host that has been
+  offline for longer than the interval still fails closed. Set `0` to sync on
+  every fetch. A positive plaintext cache TTL defers both operations until
+  that cache entry expires; the default TTL is zero.
 - Failures (missing binary, expired session, unknown item) never block
   startup — they surface as one-line warnings with a machine-readable
   error kind.

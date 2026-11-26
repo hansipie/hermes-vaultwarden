@@ -391,6 +391,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
         secrets_cfg["item_name"] = item_name
         secrets_cfg.pop("item_id", None)
     secrets_cfg["auto_unlock"] = bool(args.auto_unlock)
+    if args.auto_unlock:
+        # Written explicitly: Hermes strips *_secret_env / *_password_env
+        # targets from spawned children only when config.yaml names them.
+        for key, default in vw.credential_pointer_defaults().items():
+            secrets_cfg.setdefault(key, default)
     if server_url:
         secrets_cfg["server_url"] = server_url
     secrets_cfg.setdefault("session_env", session_env)
@@ -499,6 +504,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     console.print(Panel(table, title="Vaultwarden / Bitwarden PM", border_style="cyan"))
     for w in binding_warnings:
         console.print(f"  [yellow]warning:[/yellow] {w}")
+    if auto_unlock:
+        for w in vw.undeclared_credential_pointer_warnings(vw_cfg):
+            console.print(f"  [yellow]warning:[/yellow] {w}")
 
     if not plugin_enabled:
         console.print(

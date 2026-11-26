@@ -820,6 +820,7 @@ class TestVaultwardenSourceAutoUnlock:
                     "item_name": "Hermes",
                     "auto_unlock": True,
                     "server_url": "https://vault.example.com",
+                    "sync_interval_seconds": 0,
                 },
                 tmp_path,
             )
@@ -871,6 +872,7 @@ class TestVaultwardenSourceAutoUnlock:
                     "item_name": "Hermes",
                     "auto_unlock": True,
                     "server_url": "https://vault.example.com",
+                    "sync_interval_seconds": 0,
                 },
                 tmp_path,
             )
@@ -896,7 +898,8 @@ class TestVaultwardenSourceAutoUnlock:
             side_effect=[_make_ok_proc({}), _make_ok_proc()],
         ) as mock_run:
             result = self.source.fetch(
-                {"enabled": True, "item_name": "Hermes"}, tmp_path
+                {"enabled": True, "item_name": "Hermes", "sync_interval_seconds": 0},
+                tmp_path,
             )
 
         assert result.ok
@@ -1205,3 +1208,173 @@ class TestItemNameEnvExpansion:
         assert vw._expand_env_refs("${MISSING_VAR}") == "${MISSING_VAR}"  # stays verbatim
         assert vw._expand_env_refs("plain-name") == "plain-name"  # untouched
         assert vw._expand_env_refs("${file:/etc/x}") == "${file:/etc/x}"  # non-env ref untouched
+
+
+# ---------------------------------------------------------------------------
+# Sync interval — skip the network round-trip when the state synced recently
+# ---------------------------------------------------------------------------
+
+
+def _status_synced(seconds_ago):
+    from datetime import datetime, timedelta, timezone
+
+    stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    return _make_ok_proc({
+        "serverUrl": None,
+        "lastSync": stamp.isoformat().replace("+00:00", "Z"),
+        "status": "unlocked",
+    })
+
+
+def _argvs(mock_run):
+    return [call.args[0][1:] for call in mock_run.call_args_list]
+
+
+class TestSyncInterval:
+    def setup_method(self):
+        vw._CACHE.clear()
+
+    def _fetch(self, tmp_path, interval):
+        return vw.fetch_vaultwarden_secrets(
+            session=_FAKE_SESSION,
+            item_name="Hermes",
+            binary=Path("/usr/bin/bw"),
+            use_cache=False,
+            home_path=tmp_path,
+            sync_interval_seconds=interval,
+        )
+
+    def test_recent_sync_skips_network_sync(self, tmp_path):
+        with mock.patch(
+            "subprocess.run", side_effect=[_status_synced(30), _make_ok_proc()]
+        ) as mock_run:
+            secrets, _ = self._fetch(tmp_path, 300)
+        assert secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert _argvs(mock_run) == [["status", "--raw"], ["get", "item", "Hermes"]]
+
+    def test_old_sync_runs_network_sync(self, tmp_path):
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[_status_synced(3600), _make_ok_proc({}), _make_ok_proc()],
+        ) as mock_run:
+            self._fetch(tmp_path, 300)
+        assert _argvs(mock_run)[1] == ["sync"]
+
+    @pytest.mark.parametrize(
+        "status_proc",
+        [
+            _make_fail_proc(stderr="boom"),
+            _make_ok_proc({"status": "unlocked", "lastSync": None}),
+            _make_ok_proc({"status": "unlocked", "lastSync": "not-a-date"}),
+        ],
+        ids=["status-fails", "never-synced", "garbled"],
+    )
+    def test_unknown_last_sync_runs_network_sync(self, tmp_path, status_proc):
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[status_proc, _make_ok_proc({}), _make_ok_proc()],
+        ) as mock_run:
+            self._fetch(tmp_path, 300)
+        assert _argvs(mock_run)[1] == ["sync"]
+
+    def test_future_last_sync_runs_network_sync(self, tmp_path):
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[_status_synced(-600), _make_ok_proc({}), _make_ok_proc()],
+        ) as mock_run:
+            self._fetch(tmp_path, 300)
+        assert _argvs(mock_run)[1] == ["sync"]
+
+    def test_zero_interval_always_syncs_without_status(self, tmp_path):
+        with mock.patch(
+            "subprocess.run", side_effect=[_make_ok_proc({}), _make_ok_proc()]
+        ) as mock_run:
+            self._fetch(tmp_path, 0)
+        assert _argvs(mock_run) == [["sync"], ["get", "item", "Hermes"]]
+
+    def test_source_fetch_uses_default_interval(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch(
+            "subprocess.run", side_effect=[_status_synced(10), _make_ok_proc()]
+        ) as mock_run:
+            result = vw.VaultwardenSource().fetch(
+                {"enabled": True, "item_name": "Hermes"}, tmp_path
+            )
+        assert result.ok
+        assert ["sync"] not in _argvs(mock_run)
+
+
+# ---------------------------------------------------------------------------
+# Master password is passed verbatim
+# ---------------------------------------------------------------------------
+
+
+def test_master_password_is_not_trimmed(monkeypatch, tmp_path):
+    monkeypatch.setenv("BW_CLIENTID", "user.test-client")
+    monkeypatch.setenv("BW_CLIENTSECRET", "client-secret")
+    monkeypatch.setenv("BW_MASTER_PASSWORD", "  spaced pass  ")
+    unlock_proc = _make_ok_proc()
+    unlock_proc.stdout = "session\n"
+    with mock.patch(
+        "subprocess.run",
+        side_effect=[_make_status("locked", "https://vault.example.com"), unlock_proc],
+    ) as mock_run:
+        vw.mint_session(
+            Path("/usr/bin/bw"), home_path=tmp_path,
+            server_url="https://vault.example.com",
+        )
+    unlock_env = mock_run.call_args_list[1].kwargs["env"]
+    assert unlock_env["BW_MASTER_PASSWORD"] == "  spaced pass  "
+
+
+# ---------------------------------------------------------------------------
+# Credential pointers — Hermes strips declared *_secret_env/*_password_env
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialPointers:
+    def test_warns_when_pointers_are_not_declared(self):
+        warnings = vw.undeclared_credential_pointer_warnings({"auto_unlock": True})
+        assert len(warnings) == 1
+        assert "client_secret_env (BW_CLIENTSECRET)" in warnings[0]
+        assert "master_password_env (BW_MASTER_PASSWORD)" in warnings[0]
+
+    def test_no_warning_when_pointers_are_declared(self):
+        cfg = {"auto_unlock": True, **vw.credential_pointer_defaults()}
+        assert vw.undeclared_credential_pointer_warnings(cfg) == []
+
+    def test_declared_pointers_are_stripped_by_hermes_child_env_policy(self):
+        policy = pytest.importorskip("tools.environments.local_env_policy")
+        cfg = {"secrets": {"vaultwarden": vw.credential_pointer_defaults()}}
+        declared = policy._config_declared_key_envs(cfg)
+        assert {"BW_CLIENTSECRET", "BW_MASTER_PASSWORD"} <= declared
+
+    def test_fetch_surfaces_the_warning_in_auto_unlock_mode(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_CLIENTID", "user.test-client")
+        monkeypatch.setenv("BW_CLIENTSECRET", "client-secret")
+        monkeypatch.setenv("BW_MASTER_PASSWORD", "master-secret")
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        unlock_proc = _make_ok_proc()
+        unlock_proc.stdout = "minted\n"
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[
+                _make_status("locked", "https://vault.example.com"),
+                unlock_proc,
+                _make_ok_proc({}),
+                _make_ok_proc(),
+            ],
+        ):
+            result = vw.VaultwardenSource().fetch(
+                {
+                    "enabled": True,
+                    "item_name": "Hermes",
+                    "auto_unlock": True,
+                    "server_url": "https://vault.example.com",
+                    "sync_interval_seconds": 0,
+                },
+                tmp_path,
+            )
+        assert result.ok
+        assert any("cannot strip the credential" in w for w in result.warnings)
