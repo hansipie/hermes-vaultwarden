@@ -149,6 +149,10 @@ def test_setup_auto_unlock_does_not_persist_session(monkeypatch, tmp_path):
     vw_cfg = config["secrets"]["vaultwarden"]
     assert vw_cfg["override_existing"] is False
     assert vw_cfg["auto_unlock"] is True
+    # declared explicitly so Hermes strips them from spawned children
+    assert vw_cfg["client_id_env"] == "BW_CLIENTID"
+    assert vw_cfg["client_secret_env"] == "BW_CLIENTSECRET"
+    assert vw_cfg["master_password_env"] == "BW_MASTER_PASSWORD"
 
 
 def test_setup_item_name_clears_stale_item_id(monkeypatch):

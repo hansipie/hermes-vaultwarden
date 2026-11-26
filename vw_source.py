@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -74,6 +75,10 @@ logger = logging.getLogger(__name__)
 _BW_RUN_TIMEOUT = 30.0
 _DEFAULT_SESSION_ENV = "BW_SESSION"
 _DEFAULT_CACHE_TTL = 0.0
+# fetch() skips the network sync when the CLI state synced less than this
+# many seconds ago.  fetch_vaultwarden_secrets() itself defaults to 0
+# (always sync) for direct callers such as the setup wizard.
+_DEFAULT_SYNC_INTERVAL = 300.0
 _DEFAULT_CLIENT_ID_ENV = "BW_CLIENTID"
 _DEFAULT_CLIENT_SECRET_ENV = "BW_CLIENTSECRET"
 _DEFAULT_MASTER_PASSWORD_ENV = "BW_MASTER_PASSWORD"
@@ -285,18 +290,58 @@ def _run_bw(
     )
 
 
+def _last_sync_age(binary: Path, appdata_dir: Optional[Path]) -> Optional[float]:
+    """Seconds since the CLI state's last successful ``bw sync``, or None.
+
+    ``bw status`` is local (no network).  Any doubt (failed call, missing or
+    unparsable ``lastSync``, a timestamp in the future) returns None, which
+    makes the caller sync.
+    """
+    try:
+        proc = _run_bw(binary, "status", "--raw", appdata_dir=appdata_dir)
+    except RuntimeError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        status = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    last_sync = status.get("lastSync") if isinstance(status, dict) else None
+    if not isinstance(last_sync, str) or not last_sync.strip():
+        return None
+    try:
+        stamp = datetime.fromisoformat(last_sync.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - stamp).total_seconds()
+    return age if age >= 0 else None
+
+
 def _sync_bw_vault(
     binary: Path,
     session: str,
     *,
     appdata_dir: Optional[Path] = None,
-) -> None:
+    min_interval_seconds: float = 0.0,
+) -> bool:
     """Refresh the CLI's encrypted local vault before reading an item.
 
     ``bw get item`` reads local CLI state and does not implicitly contact the
     server.  Without this sync, an unattended profile can keep serving a
     rotated or corrected credential indefinitely across process restarts.
+
+    With ``min_interval_seconds > 0`` the network sync is skipped when the
+    state was synced more recently than that (by this or another process),
+    which bounds staleness while avoiding a round-trip on every startup.
+    Returns True when a sync ran.
     """
+    if min_interval_seconds > 0:
+        age = _last_sync_age(binary, appdata_dir)
+        if age is not None and age < min_interval_seconds:
+            return False
     proc = _run_bw(
         binary,
         "sync",
@@ -306,6 +351,7 @@ def _sync_bw_vault(
     if proc.returncode != 0:
         err = scrub_ansi(proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"bw sync failed: {err[:200]}")
+    return True
 
 
 def _bw_status(binary: Path, appdata_dir: Path) -> dict:
@@ -352,7 +398,9 @@ def mint_session(
     credentials = {
         client_id_env: str(source_env.get(client_id_env) or "").strip(),
         client_secret_env: str(source_env.get(client_secret_env) or "").strip(),
-        master_password_env: str(source_env.get(master_password_env) or "").strip(),
+        # Passed through verbatim: leading/trailing spaces can be part of
+        # a master password, and --passwordenv reads the exact value.
+        master_password_env: str(source_env.get(master_password_env) or ""),
     }
     missing = [name for name, value in credentials.items() if not value]
     if missing:
@@ -435,6 +483,7 @@ def fetch_vaultwarden_secrets(
     password_env: Optional[str] = None,
     notes_env: Optional[str] = None,
     appdata_dir: Optional[Path] = None,
+    sync_interval_seconds: float = 0.0,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull secrets from a vault item via ``bw get item``.
 
@@ -479,7 +528,10 @@ def fetch_vaultwarden_secrets(
             "https://github.com/bitwarden/clients/releases"
         )
 
-    _sync_bw_vault(bw, session, appdata_dir=appdata_dir)
+    _sync_bw_vault(
+        bw, session, appdata_dir=appdata_dir,
+        min_interval_seconds=sync_interval_seconds,
+    )
     secrets, warnings = _run_bw_get_item(
         bw,
         session,
@@ -648,6 +700,47 @@ def _classify_bw_error(message: str) -> ErrorKind:
     return ErrorKind.INTERNAL
 
 
+# Hermes strips from every spawned child (terminal tool, subprocesses) any env
+# var that config.yaml names through a ``*_secret_env`` / ``*_password_env``
+# field (local_env_policy._config_declared_key_envs).  That only works when
+# the field is written in config.yaml: a default applied in code is invisible
+# to that scan.  BW_SESSION is covered separately through token_env_key.
+_CREDENTIAL_POINTER_KEYS = (
+    ("client_secret_env", _DEFAULT_CLIENT_SECRET_ENV),
+    ("master_password_env", _DEFAULT_MASTER_PASSWORD_ENV),
+)
+
+
+def credential_pointer_defaults() -> Dict[str, str]:
+    """Pointer fields ``setup --auto-unlock`` writes so Hermes strips them."""
+    return {
+        "client_id_env": _DEFAULT_CLIENT_ID_ENV,
+        **dict(_CREDENTIAL_POINTER_KEYS),
+    }
+
+
+def undeclared_credential_pointer_warnings(cfg: dict) -> List[str]:
+    """Warn when an auto_unlock credential var is not declared in config.
+
+    Without the explicit field, Hermes does not know the var holds a secret
+    and passes it to every spawned child process.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    missing = [
+        f"{key} ({default})"
+        for key, default in _CREDENTIAL_POINTER_KEYS
+        if not str(cfg.get(key) or "").strip()
+    ]
+    if not missing:
+        return []
+    return [
+        "auto_unlock: secrets.vaultwarden." + ", ".join(missing)
+        + " not set in config.yaml, so Hermes cannot strip the credential "
+        "from spawned child processes.  Re-run `hermes vaultwarden setup "
+        "--auto-unlock` or add the field(s) explicitly."
+    ]
+
+
 def resolve_login_bindings(
     cfg: dict,
 ) -> Tuple[Dict[str, Optional[str]], List[str]]:
@@ -795,6 +888,13 @@ class VaultwardenSource(SecretSource):
                 ),
                 "default": False,
             },
+            "sync_interval_seconds": {
+                "description": (
+                    "Skip the network `bw sync` when the CLI state synced less "
+                    "than this many seconds ago; 0 syncs on every fetch"
+                ),
+                "default": int(_DEFAULT_SYNC_INTERVAL),
+            },
             "cache_ttl_seconds": {
                 "description": "Cache TTL for both cache layers; 0 disables caching",
                 "default": int(_DEFAULT_CACHE_TTL),
@@ -890,9 +990,17 @@ class VaultwardenSource(SecretSource):
             ttl = float(cfg.get("cache_ttl_seconds", _DEFAULT_CACHE_TTL))
         except (TypeError, ValueError):
             ttl = _DEFAULT_CACHE_TTL
+        try:
+            sync_interval = float(
+                cfg.get("sync_interval_seconds", _DEFAULT_SYNC_INTERVAL)
+            )
+        except (TypeError, ValueError):
+            sync_interval = _DEFAULT_SYNC_INTERVAL
 
         login_bindings, binding_warnings = resolve_login_bindings(cfg)
         result.warnings.extend(binding_warnings)
+        if auto_unlock:
+            result.warnings.extend(undeclared_credential_pointer_warnings(cfg))
 
         try:
             secrets, warnings = fetch_vaultwarden_secrets(
@@ -905,6 +1013,7 @@ class VaultwardenSource(SecretSource):
                 password_env=login_bindings["password_env"],
                 notes_env=login_bindings["notes_env"],
                 appdata_dir=appdata_dir,
+                sync_interval_seconds=sync_interval,
             )
         except RuntimeError as exc:
             result.error = str(exc)
