@@ -15,8 +15,9 @@ Design summary
   → ``PATH``.
 * Interactive use can provide a ``BW_SESSION`` token.  Unattended use can
   mint one in memory from a personal API key plus the account master
-  password.  Auto-unlock never persists the session token and isolates the
-  ``bw`` data directory beneath the active Hermes home.
+  password.  Auto-unlock never persists the session token, ignores any
+  ``BW_SESSION`` from the environment, and isolates the ``bw`` data
+  directory beneath the active Hermes home.
 * Secrets come from a single named vault item.  On every cache miss the
   profile-local CLI vault is synchronized before the item is read::
 
@@ -75,10 +76,13 @@ _DEFAULT_CLIENT_ID_ENV = "BW_CLIENTID"
 _DEFAULT_CLIENT_SECRET_ENV = "BW_CLIENTSECRET"
 _DEFAULT_MASTER_PASSWORD_ENV = "BW_MASTER_PASSWORD"
 
-# Node-based ``bw`` supports private certificate authorities through this
-# standard variable.  The path is not secret; the CLI state directory is
-# supplied explicitly per invocation instead of inherited.
-_BW_ALLOW_ENV = ("NODE_EXTRA_CA_CERTS",)
+# Node-based ``bw`` supports private certificate authorities through
+# ``NODE_EXTRA_CA_CERTS``.  ``BITWARDENCLI_APPDATA_DIR`` is inherited so
+# session-mode users who relocated bw's data dir keep reading the vault
+# their token was issued for.  In auto_unlock mode every invocation passes
+# the isolated profile dir through ``extra_env``, which overrides the
+# inherited value.  Neither path is secret.
+_BW_ALLOW_ENV = ("NODE_EXTRA_CA_CERTS", "BITWARDENCLI_APPDATA_DIR")
 
 _CacheKey = Tuple[str, str, str, str, str, str]
 # (resolved_home, session_fingerprint, item_name,
@@ -629,9 +633,11 @@ class VaultwardenSource(SecretSource):
             },
             "auto_unlock": {
                 "description": (
-                    "When true and no session token is present in session_env, "
-                    "authenticate with a personal API key and mint a session in "
-                    "memory. The token is never persisted."
+                    "When true, authenticate with a personal API key and mint a "
+                    "session in memory for the profile-isolated bw state. "
+                    "session_env is ignored in this mode (a token from .env was "
+                    "never issued for the isolated state). The token is never "
+                    "persisted."
                 ),
                 "default": False,
             },
@@ -710,13 +716,22 @@ class VaultwardenSource(SecretSource):
             result.error = str(exc)
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
-        session = str(get_source_environment().get(session_env) or "").strip()
+        env_session = str(get_source_environment().get(session_env) or "").strip()
 
         auto_unlock = bool(cfg.get("auto_unlock", False))
         appdata_dir: Optional[Path] = (
             _profile_bw_appdata(home_path) if auto_unlock else None
         )
-        if not session and auto_unlock:
+        # In auto_unlock mode the env token is never used: bw reads the
+        # isolated profile dir, and a leftover BW_SESSION from .env was
+        # issued for a different state dir (or a previous unlock).
+        session = "" if auto_unlock else env_session
+        if auto_unlock and env_session:
+            result.warnings.append(
+                f"auto_unlock: ignoring {session_env} from the environment; "
+                "a session is minted for the profile-isolated bw state"
+            )
+        if auto_unlock:
             binary0 = find_bw(cfg.get("binary_path"))
             if binary0 is None:
                 result.error = (

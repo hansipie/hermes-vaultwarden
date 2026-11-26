@@ -844,15 +844,26 @@ class TestVaultwardenSourceAutoUnlock:
         assert result.error_kind is ErrorKind.NOT_CONFIGURED
         assert "auto_unlock" in result.error
 
-    def test_existing_session_with_auto_unlock_uses_profile_appdata(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv("BW_SESSION", "existing-session")
+    def test_auto_unlock_ignores_stale_env_session(self, monkeypatch, tmp_path):
+        # A leftover BW_SESSION in .env was never issued for the isolated
+        # profile: auto mode must mint instead of reusing it.
+        monkeypatch.setenv("BW_SESSION", "stale-env-session")
+        monkeypatch.setenv("BW_CLIENTID", "user.test-client")
+        monkeypatch.setenv("BW_CLIENTSECRET", "client-secret")
+        monkeypatch.setenv("BW_MASTER_PASSWORD", "master-secret")
+        monkeypatch.setenv("BITWARDENCLI_APPDATA_DIR", "/elsewhere")
         monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
 
+        unlock_proc = _make_ok_proc()
+        unlock_proc.stdout = "fresh-session\n"
         with mock.patch(
             "subprocess.run",
-            side_effect=[_make_ok_proc({}), _make_ok_proc()],
+            side_effect=[
+                _make_status("locked", "https://vault.example.com"),
+                unlock_proc,
+                _make_ok_proc({}),    # sync
+                _make_ok_proc(),      # get item
+            ],
         ) as mock_run:
             result = self.source.fetch(
                 {
@@ -865,9 +876,32 @@ class TestVaultwardenSourceAutoUnlock:
             )
 
         assert result.ok
+        assert any("ignoring BW_SESSION" in w for w in result.warnings)
+        calls = mock_run.call_args_list
+        assert calls[2].kwargs["env"]["BW_SESSION"] == "fresh-session"
+        assert calls[3].kwargs["env"]["BW_SESSION"] == "fresh-session"
         appdata = str(tmp_path / "plugin-data" / "vaultwarden" / "bw-cli")
         assert all(
             call.kwargs["env"]["BITWARDENCLI_APPDATA_DIR"] == appdata
+            for call in calls
+        )
+
+    def test_session_mode_inherits_relocated_appdata_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setenv("BITWARDENCLI_APPDATA_DIR", "/srv/bw-data")
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[_make_ok_proc({}), _make_ok_proc()],
+        ) as mock_run:
+            result = self.source.fetch(
+                {"enabled": True, "item_name": "Hermes"}, tmp_path
+            )
+
+        assert result.ok
+        assert all(
+            call.kwargs["env"]["BITWARDENCLI_APPDATA_DIR"] == "/srv/bw-data"
             for call in mock_run.call_args_list
         )
 
