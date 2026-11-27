@@ -91,6 +91,28 @@ _DEFAULT_MASTER_PASSWORD_ENV = "BW_MASTER_PASSWORD"
 # inherited value.  Neither path is secret.
 _BW_ALLOW_ENV = ("NODE_EXTRA_CA_CERTS", "BITWARDENCLI_APPDATA_DIR")
 
+# Key: resolved profile appdata path, resolved binary path, normalized server URL,
+# three credential environment-variable names, then SHA-256 fingerprints of
+# their effective values (client ID and secret stripped; master password verbatim).
+# This cache contains session tokens in process memory only, separate from item caches.
+_AUTH_SESSIONS: dict = {}
+
+
+def _clear_auth_sessions(appdata_dir: Path) -> None:
+    profile = str(Path(appdata_dir).resolve())
+    for key in list(_AUTH_SESSIONS):
+        if key[0] == profile:
+            _AUTH_SESSIONS.pop(key, None)
+
+
+def _safe_diagnostic(text: str, values) -> str:
+    text = scrub_ansi(str(text))
+    for value in sorted({str(v) for v in values if v}, key=len, reverse=True):
+        text = text.replace(value, "[REDACTED]")
+    # Tokens are commonly long base64/base64url strings, including padded ones.
+    return re.sub(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])", "[REDACTED]", text)
+
+
 # ---------------------------------------------------------------------------
 # Config ${VAR} / ${env:VAR} expansion (plugin-side, mirrors hermes_cli/config.py)
 # ---------------------------------------------------------------------------
@@ -350,7 +372,7 @@ def _sync_bw_vault(
     )
     if proc.returncode != 0:
         err = scrub_ansi(proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(f"bw sync failed: {err[:200]}")
+        raise RuntimeError(f"bw sync failed: {err}")
     return True
 
 
@@ -358,7 +380,7 @@ def _bw_status(binary: Path, appdata_dir: Path) -> dict:
     proc = _run_bw(binary, "status", "--raw", appdata_dir=appdata_dir)
     if proc.returncode != 0:
         err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-        raise RuntimeError(f"bw status failed: {err[:200]}")
+        raise RuntimeError(f"bw status failed: {err}")
     try:
         status = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError as exc:
@@ -429,7 +451,7 @@ def mint_session(
         )
         if proc.returncode != 0:
             err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-            raise RuntimeError(f"bw config server failed: {err[:200]}")
+            raise RuntimeError(f"bw config server failed: {err}")
         persisted = str(_bw_status(binary, appdata_dir).get("serverUrl") or "").rstrip("/")
         if persisted != requested_server:
             raise RuntimeError(
@@ -451,7 +473,7 @@ def mint_session(
         )
         if proc.returncode != 0:
             err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-            raise RuntimeError(f"bw API-key login failed: {err[:200]}")
+            raise RuntimeError(f"bw API-key login failed: {err}")
 
     proc = _run_bw(
         binary,
@@ -463,8 +485,8 @@ def mint_session(
         extra_env={master_password_env: credentials[master_password_env]},
     )
     if proc.returncode != 0:
-        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-        raise RuntimeError(f"bw unlock failed: {err[:200]}")
+        err = scrub_ansi(proc.stderr or "").strip()
+        raise RuntimeError(f"bw unlock failed: {err}")
     session = (proc.stdout or "").strip()
     if not session:
         raise RuntimeError("bw unlock --raw returned an empty session token")
@@ -484,6 +506,7 @@ def fetch_vaultwarden_secrets(
     notes_env: Optional[str] = None,
     appdata_dir: Optional[Path] = None,
     sync_interval_seconds: float = 0.0,
+    force_read: bool = False,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull secrets from a vault item via ``bw get item``.
 
@@ -492,7 +515,8 @@ def fetch_vaultwarden_secrets(
     and are only included when the caller opts in via ``username_env`` /
     ``password_env`` / ``notes_env`` — the target env-var name for each.
 
-    Returns ``(secrets_dict, warnings_list)``.
+    Returns ``(secrets_dict, warnings_list)``. ``force_read`` bypasses cached
+    plaintext reads while retaining normal cache writes, to prove a new token.
 
     Raises :class:`RuntimeError` for fatal conditions (missing binary,
     auth failure, unknown item, unparseable output).
@@ -512,7 +536,7 @@ def fetch_vaultwarden_secrets(
         password_env or "",
         notes_env or "",
     )
-    if use_cache:
+    if use_cache and not force_read:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return cached.secrets, []
@@ -578,7 +602,7 @@ def _run_bw_get_item(
 
     if proc.returncode != 0:
         err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-        raise RuntimeError(f"bw exited {proc.returncode}: {err[:200]}")
+        raise RuntimeError(f"bw exited {proc.returncode}: {err}")
 
     raw = (proc.stdout or "").strip()
     if not raw:
@@ -592,7 +616,7 @@ def _run_bw_get_item(
                 "vault is locked or the session token is stale — run "
                 "`bw unlock --raw` and update BW_SESSION"
             )
-        detail = f": {err[:200]}" if err else ""
+        detail = f": {err}" if err else ""
         raise RuntimeError(f"bw returned no output{detail}")
 
     try:
@@ -831,6 +855,10 @@ class VaultwardenSource(SecretSource):
                 ),
                 "default": False,
             },
+            "remint_on_auth_expired": {
+                "description": "Reuse proven in-memory sessions and retry once on expiry in auto-unlock mode; false mints on every fetch",
+                "default": True,
+            },
             "client_id_env": {
                 "description": "Env var holding the personal API-key client ID",
                 "default": _DEFAULT_CLIENT_ID_ENV,
@@ -930,8 +958,19 @@ class VaultwardenSource(SecretSource):
         if auto_unlock and env_session:
             result.warnings.append(
                 f"auto_unlock: ignoring {session_env} from the environment; "
-                "a session is minted for the profile-isolated bw state"
+                "a session is used or minted for the profile-isolated bw state"
             )
+        gate = auto_unlock and bool(cfg.get("remint_on_auth_expired", True))
+        auth_key = None
+        from_cache = False
+        credential_names = (
+            str(cfg.get("client_id_env") or _DEFAULT_CLIENT_ID_ENV).strip(),
+            str(cfg.get("client_secret_env") or _DEFAULT_CLIENT_SECRET_ENV).strip(),
+            str(cfg.get("master_password_env") or _DEFAULT_MASTER_PASSWORD_ENV).strip(),
+        )
+        source_env = get_source_environment()
+        credential_values = [str(source_env.get(name) or "") for name in credential_names]
+        sensitive = credential_values + [env_session]
         if auto_unlock:
             binary0 = find_bw(cfg.get("binary_path"))
             if binary0 is None:
@@ -941,24 +980,31 @@ class VaultwardenSource(SecretSource):
                 )
                 result.error_kind = ErrorKind.BINARY_MISSING
                 return result
-            try:
-                session = mint_session(
-                    binary0,
-                    home_path=home_path,
-                    client_id_env=str(cfg.get("client_id_env") or _DEFAULT_CLIENT_ID_ENV),
-                    client_secret_env=str(
-                        cfg.get("client_secret_env") or _DEFAULT_CLIENT_SECRET_ENV
-                    ),
-                    master_password_env=str(
-                        cfg.get("master_password_env") or _DEFAULT_MASTER_PASSWORD_ENV
-                    ),
+            effective = [credential_values[0].strip(), credential_values[1].strip(), credential_values[2]]
+            sensitive.extend(effective)
+            auth_key = (str(appdata_dir.resolve()), str(Path(binary0).resolve()),
+                        str(cfg.get("server_url") or "").strip().rstrip("/"),
+                        *credential_names,
+                        *(hashlib.sha256(value.encode()).hexdigest() for value in effective))
+
+            def _mint():
+                return mint_session(
+                    binary0, home_path=home_path, client_id_env=credential_names[0],
+                    client_secret_env=credential_names[1], master_password_env=credential_names[2],
                     server_url=str(cfg.get("server_url") or ""),
                 )
-                result.warnings.append("auto_unlock: minted an in-memory session")
-            except RuntimeError as exc:
-                result.error = str(exc)
-                result.error_kind = _classify_bw_error(str(exc))
-                return result
+
+            session = _AUTH_SESSIONS.get(auth_key, "") if gate else ""
+            from_cache = bool(session)
+            if not session:
+                try:
+                    session = _mint()
+                    result.warnings.append("auto_unlock: minted an in-memory session")
+                except RuntimeError as exc:
+                    result.error_kind = _classify_bw_error(str(exc))
+                    result.error = _safe_diagnostic(str(exc), sensitive)[:500]
+                    return result
+            sensitive.append(session)
 
         if not session:
             result.error = (
@@ -1002,27 +1048,50 @@ class VaultwardenSource(SecretSource):
         if auto_unlock:
             result.warnings.extend(undeclared_credential_pointer_warnings(cfg))
 
-        try:
-            secrets, warnings = fetch_vaultwarden_secrets(
-                session=session,
-                item_name=item_name,
-                binary=binary,
-                cache_ttl_seconds=ttl,
-                home_path=home_path,
+        def _read(token, *, force_read=False):
+            kwargs = dict(
+                session=token, item_name=item_name, binary=binary,
+                cache_ttl_seconds=ttl, home_path=home_path,
                 username_env=login_bindings["username_env"],
                 password_env=login_bindings["password_env"],
-                notes_env=login_bindings["notes_env"],
-                appdata_dir=appdata_dir,
+                notes_env=login_bindings["notes_env"], appdata_dir=appdata_dir,
                 sync_interval_seconds=sync_interval,
             )
+            if force_read:
+                kwargs["force_read"] = True
+            return fetch_vaultwarden_secrets(**kwargs)
+
+        try:
+            secrets, warnings = _read(session, force_read=gate and not from_cache)
         except RuntimeError as exc:
-            result.error = str(exc)
-            result.error_kind = _classify_bw_error(str(exc))
-            return result
+            kind = _classify_bw_error(str(exc))
+            original = _safe_diagnostic(str(exc), sensitive)[:500]
+            # A logged-out profile needs explicit reauthentication/reset, not
+            # an automatic remint; still discard its rejected cached token.
+            if gate and from_cache and kind == ErrorKind.AUTH_EXPIRED:
+                _AUTH_SESSIONS.pop(auth_key, None)
+            if not (gate and from_cache and kind == ErrorKind.AUTH_EXPIRED
+                    and "not logged in" not in str(exc).lower()):
+                result.error, result.error_kind = original, kind
+                return result
+            try:
+                session = _mint()
+                sensitive.append(session)
+                secrets, warnings = _read(session, force_read=True)
+                result.warnings.append("remint_on_auth_expired: read retried with an in-memory session")
+            except Exception as retry_exc:  # preserve original classification
+                diagnostic = _safe_diagnostic(str(retry_exc), sensitive).strip()[:240]
+                result.error = original + " — recovery failed: " + diagnostic
+                result.error_kind = kind
+                return result
         except Exception as exc:  # noqa: BLE001 — contract: never raise
-            result.error = f"unexpected error: {exc}"
+            result.error = "unexpected error: " + _safe_diagnostic(str(exc), sensitive)[:500]
             result.error_kind = ErrorKind.INTERNAL
             return result
+
+        if gate:
+            _AUTH_SESSIONS[auth_key] = session
+        warnings = [_safe_diagnostic(w, sensitive) for w in warnings]
 
         result.secrets = secrets
         result.warnings.extend(warnings)
@@ -1036,4 +1105,5 @@ class VaultwardenSource(SecretSource):
 
 def _reset_cache_for_tests(home_path: Optional[Path] = None) -> None:
     _CACHE.clear()
+    _AUTH_SESSIONS.clear()
     _DISK_CACHE.clear(home_path)

@@ -56,7 +56,12 @@ The session token remains in process memory; any `BW_SESSION` already present
 in the environment is ignored in this mode (with a warning), since it was not
 issued for the isolated CLI state. Each Hermes profile gets isolated
 CLI state under `$HERMES_HOME/plugin-data/vaultwarden/bw-cli`, so profiles do
-not share login state.
+not share login state. Within one process, a session is reused only after a
+successful vault read. If a cached session expires, the plugin mints once and
+retries the read once (a logged-out CLI state is not retried). Sessions are
+never persisted for reuse across processes.
+Set `remint_on_auth_expired: false` to disable both reuse and recovery; auto
+mode then mints on every fetch. Session mode is unaffected.
 
 Unattended mode requires an explicit HTTPS `server_url` and verifies that the
 CLI persisted it before sending credentials. Sandboxed wrappers that cannot
@@ -117,6 +122,7 @@ clears it from `config.yaml`.
 | `enabled` | `false` | Master switch |
 | `session_env` | `BW_SESSION` | Env var holding the `bw unlock --raw` token |
 | `auto_unlock` | `false` | Mint a memory-only session from personal API-key credentials (`session_env` is then ignored) |
+| `remint_on_auth_expired` | `true` | Reuse proven in-memory auto-unlock sessions and retry once after expiry |
 | `client_id_env` | `BW_CLIENTID` | Name of the personal API-key client-ID env var |
 | `client_secret_env` | `BW_CLIENTSECRET` | Name of the personal API-key client-secret env var |
 | `master_password_env` | `BW_MASTER_PASSWORD` | Name of the master-password env var |

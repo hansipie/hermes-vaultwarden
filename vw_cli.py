@@ -681,6 +681,8 @@ def cmd_reset_auth(args: argparse.Namespace) -> int:
     console = Console()
     cfg = load_config()
     vw_cfg = (cfg.get("secrets") or {}).get("vaultwarden") or {}
+    appdata_dir = vw._profile_bw_appdata(get_hermes_home())
+    vw._clear_auth_sessions(appdata_dir)
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     if binary is None:
         console.print("[red]bw binary not found.[/red]")
