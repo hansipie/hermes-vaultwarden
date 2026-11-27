@@ -801,6 +801,17 @@ def _classify_bw_error(message: str) -> ErrorKind:
         )
     ):
         return ErrorKind.AUTH_FAILED
+    # bw echoes the item reference in "not found" errors, so an item named
+    # e.g. "session-backup" must not trip the generic auth keywords below
+    # (which, with remint_on_auth_expired, would evict and re-mint a session).
+    # Only unambiguous auth phrases take precedence over a missing reference.
+    if ("not found" in lowered or "more than one result" in lowered) and not any(
+        tok in lowered for tok in (
+            "not logged in", "vault is locked", "session expired",
+            "session key", "invalid session", "unauthorized", "mac failed",
+        )
+    ):
+        return ErrorKind.REF_INVALID
     if any(tok in lowered for tok in (
         "session", "unlock", "not logged in", "vault is locked", "locked",
         "unauthorized", "mac failed",
