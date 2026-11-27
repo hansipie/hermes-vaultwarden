@@ -355,3 +355,51 @@ def test_sync_apply_respects_preserve_and_cross_source_precedence(
     assert cli.os.environ["PRESERVE_KEY"] == "working-value"
     assert "SHARED_KEY" not in cli.os.environ
     assert cli.os.environ["VAULT_ONLY"] == "vault-value"
+
+
+# --- bw output shown by the CLI is redacted, bounded and markup-safe ---
+
+
+def _recording_console():
+    from rich.console import Console
+    return Console(record=True, force_terminal=False, width=400)
+
+
+def test_list_items_failure_redacts_session_and_escapes_markup(monkeypatch):
+    stdout = f"[/bold] boom {_SESSION} " + "z" * 1000
+    monkeypatch.setattr(
+        cli, "run_secret_cli",
+        lambda *a, **k: _proc(stdout=stdout, stderr="", returncode=1),
+    )
+    console = _recording_console()
+    assert cli._list_items(Path("/bin/bw"), _SESSION, console) is None
+    out = console.export_text()
+    assert _SESSION not in out
+    assert "[/bold] boom [REDACTED]" in out
+    assert "z" * 400 not in out
+
+
+def test_list_items_failure_with_no_output_does_not_crash(monkeypatch):
+    monkeypatch.setattr(
+        cli, "run_secret_cli",
+        lambda *a, **k: _proc(stdout=None, stderr=None, returncode=1),
+    )
+    console = _recording_console()
+    assert cli._list_items(Path("/bin/bw"), _SESSION, console) is None
+
+
+def test_reset_auth_failure_redacts_and_escapes(monkeypatch, tmp_path):
+    monkeypatch.setenv("BW_CLIENTSECRET", "client-secret-value")
+    monkeypatch.setattr(cli, "load_config", lambda: {})
+    monkeypatch.setattr(cli, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(vw, "find_bw", lambda *_: Path("/bin/bw"))
+    monkeypatch.setattr(
+        vw, "_run_bw",
+        lambda *a, **k: _proc(stderr="[/x] client-secret-value", returncode=1),
+    )
+    console = _recording_console()
+    monkeypatch.setattr(cli, "Console", lambda: console)
+    assert cli.cmd_reset_auth(argparse.Namespace()) == 1
+    out = console.export_text()
+    assert "client-secret-value" not in out
+    assert "bw logout failed: [/x] [REDACTED]" in out
