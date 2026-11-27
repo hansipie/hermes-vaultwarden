@@ -233,7 +233,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
             )
             appdata_dir = vw._profile_bw_appdata(get_hermes_home())
         except RuntimeError as exc:
-            console.print(f"  [red]Unattended authentication failed: {exc}[/red]")
+            console.print(
+                f"  [red]Unattended authentication failed: {vw.cli_safe_error(exc)}[/red]"
+            )
             return 1
         console.print("  [green]✓[/green] API-key login and in-memory unlock succeeded")
     else:
@@ -355,7 +357,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             appdata_dir=appdata_dir,
         )
     except Exception as exc:  # noqa: BLE001
-        console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
+        console.print(f"  [red]✗ Fetch failed: {vw.cli_safe_error(exc, session)}[/red]")
         return 1
 
     if not secrets:

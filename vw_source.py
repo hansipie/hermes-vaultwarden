@@ -130,7 +130,45 @@ def _reset_auth_transaction(appdata_dir: Path):
                 del _AUTH_RESETTING[profile]
 
 
-def _safe_diagnostic(text: str, values, session_env: str = _DEFAULT_SESSION_ENV) -> str:
+# Upper bound on bw output carried inside an exception.  Callers redact
+# before truncating further, so this only stops arbitrarily large output.
+_ERR_CAP = 4096
+
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_TOKEN_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])"
+)
+
+
+def _bw_error_text(proc) -> str:
+    """stderr-or-stdout of a failed bw call, ANSI-scrubbed and bounded."""
+    return scrub_ansi(proc.stderr or proc.stdout or "").strip()[:_ERR_CAP]
+
+
+def _looks_like_token(candidate: str) -> bool:
+    # Item UUIDs and identifier-like strings stay readable: separator-joined
+    # segments that are each single-case (snake_case / UPPER_CASE env names,
+    # kebab-case, lowercase path segments).  Anything else of token length
+    # (base64 session keys, unseparated blobs) is treated as a secret.
+    if _UUID_RE.fullmatch(candidate):
+        return False
+    segments = [s for s in re.split(r"[_/-]+", candidate) if s]
+    if len(segments) < 2 or any(c in candidate for c in "+="):
+        return True
+    return any(s != s.lower() and s != s.upper() for s in segments)
+
+
+def _safe_diagnostic(
+    text: str, values, session_env: str = _DEFAULT_SESSION_ENV, *, generic: bool = True
+) -> str:
+    """Redact secrets from a diagnostic.
+
+    Known ``values`` and labelled session patterns are always redacted.
+    ``generic`` additionally redacts unlabelled token-shaped strings; it is
+    meant for raw bw output and is disabled for plugin-built warnings.
+    """
     text = scrub_ansi(str(text))
     for value in sorted({str(v) for v in values if v}, key=len, reverse=True):
         text = text.replace(value, "[REDACTED]")
@@ -142,8 +180,29 @@ def _safe_diagnostic(text: str, values, session_env: str = _DEFAULT_SESSION_ENV)
         r"\1[REDACTED]", text,
     )
     text = re.sub(r"(?i)(\bsession\s+)([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)", r"\1[REDACTED]", text)
+    if not generic:
+        return text
     # Tokens are commonly long base64/base64url strings, including padded ones.
-    return re.sub(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])", "[REDACTED]", text)
+    return _TOKEN_CANDIDATE_RE.sub(
+        lambda m: "[REDACTED]" if _looks_like_token(m.group(0)) else m.group(0), text
+    )
+
+
+def cli_safe_error(exc: BaseException, session: str = "") -> str:
+    """Redacted, bounded rendering of an exception for direct CLI callers.
+
+    ``mint_session`` and ``fetch_vaultwarden_secrets`` raise with full bw
+    output so ``VaultwardenSource.fetch`` can redact before truncating;
+    callers printing those exceptions must apply the same guarantee.
+    """
+    env = get_source_environment()
+    values = [session] + [
+        str(env.get(name) or "")
+        for name in (_DEFAULT_CLIENT_ID_ENV, _DEFAULT_CLIENT_SECRET_ENV,
+                     _DEFAULT_MASTER_PASSWORD_ENV, _DEFAULT_SESSION_ENV)
+    ]
+    values += [v.strip() for v in values]
+    return _safe_diagnostic(str(exc), values)[:500]
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +463,7 @@ def _sync_bw_vault(
         extra_env={"BW_SESSION": session},
     )
     if proc.returncode != 0:
-        err = scrub_ansi(proc.stderr or proc.stdout or "").strip()
+        err = _bw_error_text(proc)
         raise RuntimeError(f"bw sync failed: {err}")
     return True
 
@@ -412,7 +471,7 @@ def _sync_bw_vault(
 def _bw_status(binary: Path, appdata_dir: Path) -> dict:
     proc = _run_bw(binary, "status", "--raw", appdata_dir=appdata_dir)
     if proc.returncode != 0:
-        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+        err = _bw_error_text(proc)
         raise RuntimeError(f"bw status failed: {err}")
     try:
         status = json.loads(proc.stdout or "{}")
@@ -483,7 +542,7 @@ def mint_session(
             binary, "config", "server", requested_server, appdata_dir=appdata_dir
         )
         if proc.returncode != 0:
-            err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+            err = _bw_error_text(proc)
             raise RuntimeError(f"bw config server failed: {err}")
         persisted = str(_bw_status(binary, appdata_dir).get("serverUrl") or "").rstrip("/")
         if persisted != requested_server:
@@ -505,7 +564,7 @@ def mint_session(
             },
         )
         if proc.returncode != 0:
-            err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+            err = _bw_error_text(proc)
             raise RuntimeError(f"bw API-key login failed: {err}")
 
     proc = _run_bw(
@@ -518,7 +577,7 @@ def mint_session(
         extra_env={master_password_env: credentials[master_password_env]},
     )
     if proc.returncode != 0:
-        err = scrub_ansi(proc.stderr or "").strip()
+        err = scrub_ansi(proc.stderr or "").strip()[:_ERR_CAP]
         raise RuntimeError(f"bw unlock failed: {err}")
     session = (proc.stdout or "").strip()
     if not session:
@@ -634,7 +693,7 @@ def _run_bw_get_item(
     )
 
     if proc.returncode != 0:
-        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+        err = _bw_error_text(proc)
         raise RuntimeError(f"bw exited {proc.returncode}: {err}")
 
     raw = (proc.stdout or "").strip()
@@ -643,7 +702,7 @@ def _run_bw_get_item(
         # password; with stdin on /dev/null its readline crashes yet bw
         # still exits 0 with empty stdout.  Treat that as fatal (and never
         # cache it) instead of a silent "no fields" warning.
-        err = scrub_ansi(proc.stderr or "").strip()
+        err = scrub_ansi(proc.stderr or "").strip()[:_ERR_CAP]
         if "master password" in err.lower():
             raise RuntimeError(
                 "vault is locked or the session token is stale — run "
@@ -1131,7 +1190,7 @@ class VaultwardenSource(SecretSource):
                         and _AUTH_GENERATIONS.get(auth_key[0], 0) == generation
                         and _AUTH_SESSIONS.get(auth_key) == expected_session):
                     _AUTH_SESSIONS[auth_key] = session
-        warnings = [_safe_diagnostic(w, sensitive, session_env) for w in warnings]
+        warnings = [_safe_diagnostic(w, sensitive, session_env, generic=False) for w in warnings]
 
         result.secrets = secrets
         result.warnings.extend(warnings)

@@ -418,3 +418,58 @@ def test_overlapping_resets_keep_publication_fenced(rig, monkeypatch):
     assert not vw._AUTH_SESSIONS
     assert not rig.source.fetch(rig.cfg, rig.home).error
     assert rig.read.call_args.kwargs['session'] == 'mint-token-two'
+
+
+# --- PR #7 review follow-ups: redaction must not corrupt plugin diagnostics ---
+
+_NO_FIELDS_HINT = (
+    "item has no custom fields — add fields named after the env vars "
+    "you want to export, or set username_env/password_env/notes_env "
+    "to pull the login/notes values instead"
+)
+
+
+@pytest.mark.parametrize('text', [
+    'or set username_env/password_env/notes_env to pull',
+    'state dir /var/home/user/.hermes/plugin-data/vaultwarden/bw-cli',
+    'item 123e4567-e89b-12d3-a456-426614174000 not found',
+    "Skipping field 'MY_VERY_LONG_VAULTWARDEN_ENV_NAME_X'",
+])
+def test_generic_redaction_keeps_identifiers_paths_and_uuids(text):
+    assert vw._safe_diagnostic(text, []) == text
+
+
+def test_generic_redaction_still_masks_base64_tokens():
+    import base64
+    import os
+    token = base64.b64encode(os.urandom(64)).decode()
+    url_token = token.replace('+', '-').replace('/', '_').rstrip('=')
+    out = vw._safe_diagnostic(f'bw said {token} then {url_token}', [])
+    assert token not in out and url_token not in out
+    assert out.count('[REDACTED]') == 2
+
+
+def test_static_no_fields_warning_survives_fetch(rig):
+    rig.read.return_value = ({}, [_NO_FIELDS_HINT])
+    result = rig.source.fetch(rig.cfg, rig.home)
+    assert not result.error
+    assert _NO_FIELDS_HINT in result.warnings
+
+
+def test_warnings_still_redact_known_values(rig):
+    rig.read.return_value = ({}, ['leaked mint-token-one here'])
+    result = rig.source.fetch(rig.cfg, rig.home)
+    assert 'mint-token-one' not in ' '.join(result.warnings)
+
+
+def test_cli_safe_error_redacts_and_bounds(monkeypatch):
+    monkeypatch.setenv('BW_CLIENTSECRET', 'client-secret-value')
+    exc = RuntimeError('bw exited 1: client-secret-value sess-xyz ' + 'x' * 5000)
+    out = vw.cli_safe_error(exc, 'sess-xyz')
+    assert 'client-secret-value' not in out and 'sess-xyz' not in out
+    assert len(out) <= 500
+
+
+def test_bw_error_text_is_bounded():
+    proc = SimpleNamespace(stderr='', stdout='y' * 10_000)
+    assert len(vw._bw_error_text(proc)) == vw._ERR_CAP
