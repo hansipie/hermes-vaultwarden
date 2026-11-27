@@ -682,23 +682,23 @@ def cmd_reset_auth(args: argparse.Namespace) -> int:
     cfg = load_config()
     vw_cfg = (cfg.get("secrets") or {}).get("vaultwarden") or {}
     appdata_dir = vw._profile_bw_appdata(get_hermes_home())
-    vw._clear_auth_sessions(appdata_dir)
-    binary = vw.find_bw(vw_cfg.get("binary_path"))
-    if binary is None:
-        console.print("[red]bw binary not found.[/red]")
-        return 1
-    try:
-        res = vw._run_bw(binary, "logout", appdata_dir=appdata_dir)
-    except RuntimeError as exc:
-        console.print(f"[red]Could not reset profile authentication: {exc}[/red]")
-        return 1
-    if res.returncode != 0:
-        err = (res.stderr or res.stdout or "").strip()[:200]
-        if "not logged in" not in err.lower():
-            console.print(f"[red]bw logout failed: {err}[/red]")
+    with vw._reset_auth_transaction(appdata_dir):
+        binary = vw.find_bw(vw_cfg.get("binary_path"))
+        if binary is None:
+            console.print("[red]bw binary not found.[/red]")
             return 1
-    console.print("[green]Profile authentication reset.[/green] No vault items were changed.")
-    return 0
+        try:
+            res = vw._run_bw(binary, "logout", appdata_dir=appdata_dir)
+        except RuntimeError as exc:
+            console.print(f"[red]Could not reset profile authentication: {exc}[/red]")
+            return 1
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()[:200]
+            if "not logged in" not in err.lower():
+                console.print(f"[red]bw logout failed: {err}[/red]")
+                return 1
+        console.print("[green]Profile authentication reset.[/green] No vault items were changed.")
+        return 0
 
 
 # ---------------------------------------------------------------------------

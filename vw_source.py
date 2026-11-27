@@ -48,6 +48,7 @@ Design summary
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
@@ -99,6 +100,8 @@ _BW_ALLOW_ENV = ("NODE_EXTRA_CA_CERTS", "BITWARDENCLI_APPDATA_DIR")
 _AUTH_SESSIONS: dict = {}
 # Reset increments a profile generation, fencing publication by older fetches.
 _AUTH_GENERATIONS: dict = {}
+# Counts keep overlapping resets fenced until the last logout completes.
+_AUTH_RESETTING: dict = {}
 _AUTH_LOCK = threading.RLock()
 
 
@@ -111,12 +114,33 @@ def _clear_auth_sessions(appdata_dir: Path) -> None:
                 _AUTH_SESSIONS.pop(key, None)
 
 
-def _safe_diagnostic(text: str, values) -> str:
+@contextmanager
+def _reset_auth_transaction(appdata_dir: Path):
+    profile = str(Path(appdata_dir).resolve())
+    with _AUTH_LOCK:
+        _AUTH_RESETTING[profile] = _AUTH_RESETTING.get(profile, 0) + 1
+        _clear_auth_sessions(appdata_dir)
+    try:
+        yield
+    finally:
+        with _AUTH_LOCK:
+            _clear_auth_sessions(appdata_dir)
+            _AUTH_RESETTING[profile] -= 1
+            if not _AUTH_RESETTING[profile]:
+                del _AUTH_RESETTING[profile]
+
+
+def _safe_diagnostic(text: str, values, session_env: str = _DEFAULT_SESSION_ENV) -> str:
     text = scrub_ansi(str(text))
     for value in sorted({str(v) for v in values if v}, key=len, reverse=True):
         text = text.replace(value, "[REDACTED]")
-    # Preserve upstream stderr-or-stdout failure fallback; mask labeled session values.
-    text = re.sub(r"(?i)((?:--session\s+|\bsession\s*[:=]\s*)[\"\']?)([^\s,;\"\']+)", r"\1[REDACTED]", text)
+    # Preserve upstream stderr-or-stdout fallback; redact contextual session values
+    # from either stream, including the configured session environment name.
+    labels = r"[A-Z0-9_]*SESSION|" + re.escape(session_env)
+    text = re.sub(
+        rf"(?i)((?:--session\s+|\b(?:{labels})\s*[:=]\s*)[\"']?)([^\s\"']+)",
+        r"\1[REDACTED]", text,
+    )
     text = re.sub(r"(?i)(\bsession\s+)([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)", r"\1[REDACTED]", text)
     # Tokens are commonly long base64/base64url strings, including padded ones.
     return re.sub(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])", "[REDACTED]", text)
@@ -1014,7 +1038,7 @@ class VaultwardenSource(SecretSource):
                     result.warnings.append("auto_unlock: minted an in-memory session")
                 except RuntimeError as exc:
                     result.error_kind = _classify_bw_error(str(exc))
-                    result.error = _safe_diagnostic(str(exc), sensitive)[:500]
+                    result.error = _safe_diagnostic(str(exc), sensitive, session_env)[:500]
                     return result
             sensitive.append(session)
 
@@ -1077,7 +1101,7 @@ class VaultwardenSource(SecretSource):
             secrets, warnings = _read(session, force_read=gate and not from_cache)
         except RuntimeError as exc:
             kind = _classify_bw_error(str(exc))
-            original = _safe_diagnostic(str(exc), sensitive)[:500]
+            original = _safe_diagnostic(str(exc), sensitive, session_env)[:500]
             if gate and from_cache and kind == ErrorKind.AUTH_EXPIRED:
                 with _AUTH_LOCK:
                     if _AUTH_SESSIONS.get(auth_key) == session:
@@ -1092,21 +1116,22 @@ class VaultwardenSource(SecretSource):
                 secrets, warnings = _read(session, force_read=True)
                 result.warnings.append("remint_on_auth_expired: read retried with an in-memory session")
             except Exception as retry_exc:  # preserve original classification
-                diagnostic = _safe_diagnostic(str(retry_exc), sensitive).strip()[:240]
+                diagnostic = _safe_diagnostic(str(retry_exc), sensitive, session_env).strip()[:240]
                 result.error = original + " — recovery failed: " + diagnostic
                 result.error_kind = kind
                 return result
         except Exception as exc:  # noqa: BLE001 — contract: never raise
-            result.error = "unexpected error: " + _safe_diagnostic(str(exc), sensitive)[:500]
+            result.error = "unexpected error: " + _safe_diagnostic(str(exc), sensitive, session_env)[:500]
             result.error_kind = ErrorKind.INTERNAL
             return result
 
         if gate:
             with _AUTH_LOCK:
-                if (_AUTH_GENERATIONS.get(auth_key[0], 0) == generation
+                if (not _AUTH_RESETTING.get(auth_key[0])
+                        and _AUTH_GENERATIONS.get(auth_key[0], 0) == generation
                         and _AUTH_SESSIONS.get(auth_key) == expected_session):
                     _AUTH_SESSIONS[auth_key] = session
-        warnings = [_safe_diagnostic(w, sensitive) for w in warnings]
+        warnings = [_safe_diagnostic(w, sensitive, session_env) for w in warnings]
 
         result.secrets = secrets
         result.warnings.extend(warnings)

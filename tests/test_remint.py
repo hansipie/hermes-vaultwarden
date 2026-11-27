@@ -57,10 +57,11 @@ def test_context_change_requires_new_mint(rig, change):
     if change == 'id': rig.env['BW_CLIENTID'] = 'rotated-client'
     if change == 'secret': rig.env['BW_CLIENTSECRET'] = 'rotated-secret'
     if change == 'password': rig.env['BW_MASTER_PASSWORD'] = 'rotated-passphrase'
-    assert not rig.source.fetch(cfg, home).error
+    result = rig.source.fetch(cfg, home)
+    assert not result.error
     assert rig.mint.call_count == 2
     assert [c.kwargs['session'] for c in rig.read.call_args_list] == ['mint-token-one', 'mint-token-two']
-    assert all(value not in str(rig.source.fetch(cfg, home).error or '') + repr(rig.source.fetch(cfg, home).warnings) for value in rig.env.values() if value)
+    assert all(value not in str(result.error or '') + repr(result.warnings) for value in rig.env.values() if value)
     assert all('client-secret' not in repr(key) and 'password' not in repr(key) for key in vw._AUTH_SESSIONS)
 
 
@@ -257,7 +258,12 @@ def test_concurrent_recoveries_publish_at_most_one_proven_token(rig):
     for worker in workers: worker.join(5)
     assert all(not worker.is_alive() for worker in workers)
     assert len(results) == 2 and all(not result.error for result in results)
-    assert list(vw._AUTH_SESSIONS.values()) in ([], ['fresh-one'], ['fresh-two'])
+    assert list(vw._AUTH_SESSIONS.values()) in (['fresh-one'], ['fresh-two'])
+    proven = next(iter(vw._AUTH_SESSIONS.values()))
+    assert rig.mint.call_count == 3
+    assert not rig.source.fetch(rig.cfg, rig.home).error
+    assert rig.mint.call_count == 3
+    assert rig.read.call_args.kwargs['session'] == proven
 
 
 def test_logout_recovery_real_sequence(tmp_path, monkeypatch):
@@ -324,5 +330,91 @@ def test_reset_failure_still_prevents_reuse(rig, monkeypatch, failure):
         monkeypatch.setattr(vw, '_run_bw', fail)
     assert cli.cmd_reset_auth(argparse.Namespace()) == 1
     rig.find.return_value = Path('/bin/bw')
+    assert not rig.source.fetch(rig.cfg, rig.home).error
+    assert rig.read.call_args.kwargs['session'] == 'mint-token-two'
+
+
+@pytest.mark.parametrize('outcome', ['success', 'not_logged_in', 'failure', 'exception'])
+def test_reset_fences_fetch_during_logout(rig, monkeypatch, outcome):
+    from threading import Event, Thread
+    assert not rig.source.fetch(rig.cfg, rig.home).error
+    monkeypatch.setattr(cli, 'get_hermes_home', lambda: rig.home)
+    monkeypatch.setattr(cli, 'load_config', lambda: {})
+    entered, release = Event(), Event()
+    def logout(*args, **kwargs):
+        assert args[1] == 'logout'
+        entered.set()
+        assert release.wait(5)
+        if outcome == 'exception':
+            raise RuntimeError('logout failed')
+        return SimpleNamespace(returncode=0 if outcome == 'success' else 1,
+                               stderr={'not_logged_in': 'not logged in', 'failure': 'failed'}.get(outcome, ''), stdout='')
+    monkeypatch.setattr(vw, '_run_bw', logout)
+    results = []
+    worker = Thread(target=lambda: results.append(cli.cmd_reset_auth(argparse.Namespace())))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert not rig.source.fetch(rig.cfg, rig.home).error
+        assert rig.read.call_args.kwargs['session'] == 'mint-token-two'
+        assert not vw._AUTH_SESSIONS
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert results == [0 if outcome in ('success', 'not_logged_in') else 1]
+    assert not vw._AUTH_SESSIONS
+    assert not rig.source.fetch(rig.cfg, rig.home).error
+    assert rig.read.call_args.kwargs['session'] == 'mint-token-three'
+
+@pytest.mark.parametrize('label,session_env', [('BW_SESSION', 'BW_SESSION'), ('MY_SESSION', 'BW_SESSION'), ('CUSTOM_TOKEN', 'CUSTOM_TOKEN'), ('session', 'BW_SESSION'), ('--session ', 'BW_SESSION')])
+def test_failed_get_stdout_redacts_unknown_session(tmp_path, monkeypatch, label, session_env):
+    from unittest.mock import Mock
+    vw._reset_cache_for_tests(tmp_path)
+    monkeypatch.setattr(vw, 'get_source_environment', lambda: {session_env: 'known-session'})
+    monkeypatch.setattr(vw, 'find_bw', lambda *_: Path('/bin/bw'))
+    proc = lambda out='', code=0: SimpleNamespace(stdout=out, stderr='', returncode=code)
+    sep = '' if label.endswith(' ') else '='
+    run = Mock(side_effect=[proc(), proc('failure ' + label + sep + 'abcd.efgh.ijkl', 1)])
+    monkeypatch.setattr(vw, 'run_secret_cli', run)
+    result = vw.VaultwardenSource().fetch({'item_name': 'item', 'session_env': session_env, 'sync_interval_seconds': 0}, tmp_path)
+    assert result.error
+    assert 'abcd.efgh.ijkl' not in result.error + repr(result.warnings)
+    assert [c.args[0][1:] for c in run.call_args_list] == [['sync'], ['get', 'item', 'item']]
+
+
+def test_overlapping_resets_keep_publication_fenced(rig, monkeypatch):
+    from threading import Event, Lock, Thread
+    monkeypatch.setattr(cli, 'get_hermes_home', lambda: rig.home)
+    monkeypatch.setattr(cli, 'load_config', lambda: {})
+    entered = [Event(), Event()]
+    release = [Event(), Event()]
+    lock = Lock()
+    indices = iter(range(2))
+    def logout(*args, **kwargs):
+        with lock:
+            index = next(indices)
+        entered[index].set()
+        assert release[index].wait(5)
+        return SimpleNamespace(returncode=0, stderr='', stdout='')
+    monkeypatch.setattr(vw, '_run_bw', logout)
+    results = []
+    workers = [Thread(target=lambda: results.append(cli.cmd_reset_auth(argparse.Namespace()))) for _ in range(2)]
+    try:
+        workers[0].start()
+        assert entered[0].wait(5)
+        workers[1].start()
+        assert entered[1].wait(5)
+        release[0].set()
+        workers[0].join(5)
+        assert not workers[0].is_alive()
+        assert not rig.source.fetch(rig.cfg, rig.home).error
+        assert not vw._AUTH_SESSIONS
+    finally:
+        for event in release: event.set()
+        for worker in workers:
+            if worker.ident is not None: worker.join(5)
+    assert results == [0, 0]
+    assert not vw._AUTH_SESSIONS
     assert not rig.source.fetch(rig.cfg, rig.home).error
     assert rig.read.call_args.kwargs['session'] == 'mint-token-two'
