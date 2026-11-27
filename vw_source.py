@@ -1144,18 +1144,42 @@ class VaultwardenSource(SecretSource):
         # is eligible. Cached-token reads do not repeatedly rewrite the file.
         if auto_unlock and minted_this_call and cfg.get("persist_session_file", False):
             try:
-                from hermes_cli.config import get_env_path, require_env_writable, save_env_value
+                from hermes_cli.config import (
+                    _env_line_defines_key, _quote_env_value, get_env_path,
+                    require_env_writable, save_env_value,
+                )
 
                 env_path = get_env_path()  # Honors the routed profile-home override.
                 if env_path.parent.resolve() != Path(home_path).resolve():
                     result.warnings.append("persist_session_file: active profile mismatch; session not persisted")
                 elif env_path.exists():
-                    # The helper silently refuses managed writes; check first for a warning.
+                    lines = env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+                    matches = [i for i, line in enumerate(lines, 1)
+                               if _env_line_defines_key(line, session_env)]
+                    # Preflight narrows common refusals; post-read checks the outcome
+                    # because the helper has no success return and rechecks policy.
                     require_env_writable(session_env, "set")
                     # Core may publish to os.environ or the routed scope. This is
                     # intentional when opted in, not a memory-only guarantee.
+                    # Its default path repeats get_env_path(), so profile context may race.
+                    # Core's atomic replacement may replace a symlink, not its target.
                     save_env_value(session_env, session)
-                # Missing files are deliberately not created.
+                    written = env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+                    first = next((line for line in written
+                                  if _env_line_defines_key(line, session_env)), None)
+                    expected = _quote_env_value(session.replace("\n", "").replace("\r", ""))
+                    if first != f"{session_env}={expected}":
+                        result.warnings.append(
+                            "persist_session_file: session line not updated; env-write policy may have refused it"
+                        )
+                    if len(matches) > 1:
+                        numbers = ", ".join(str(i) for i in matches[1:])
+                        result.warnings.append(
+                            "persist_session_file: later duplicate assignment(s) at line(s) "
+                            + numbers + " shadow the session for ambient readers"
+                        )
+                # The existence check cannot prevent creation if the file disappears
+                # before core acquires its write lock.
             except Exception:  # best effort; never expose exception text or token
                 result.warnings.append("persist_session_file: could not persist the session")
         warnings = [_safe_diagnostic(w, sensitive, session_env) for w in warnings]

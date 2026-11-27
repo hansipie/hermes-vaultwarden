@@ -76,13 +76,76 @@ def test_real_helper_normalizes_and_publishes(rig, monkeypatch):
     assert os.environ["BW_SESSION"] == "fresh token#one"
 
 
+def successful_baseline(rig):
+    home, cfg, source, mint, read = rig
+    baseline = source.fetch({**cfg, "persist_session_file": False}, home)
+    assert baseline.ok and baseline.secrets == {"A": "value"}
+    vw._reset_cache_for_tests(home)
+    mint.side_effect = ["fresh token#one", "fresh-token-two"]
+    mint.reset_mock()
+    return baseline
+
+
+def assert_preserved_and_redacted(result, baseline):
+    assert (result.ok, result.secrets, result.error, result.error_kind) == (
+        baseline.ok, baseline.secrets, baseline.error, baseline.error_kind
+    )
+    assert any("persist" in warning.lower() for warning in result.warnings)
+    assert "fresh token#one" not in repr(result.warnings)
+
+
+def test_duplicate_warns_and_real_reader_sees_shadow(rig, monkeypatch):
+    from agent.secret_scope import load_env_file
+
+    home, cfg, source, mint, read = rig
+    monkeypatch.delenv("BW_SESSION", raising=False)
+    env = home / ".env"
+    env.write_text("export BW_SESSION=old-first\nOTHER=yes\n BW_SESSION = old-later\n")
+    result = source.fetch(cfg, home)
+    assert result.ok
+    assert env.read_text().splitlines()[0] == 'BW_SESSION="fresh token#one"'
+    assert load_env_file(env)["BW_SESSION"] == "old-later"
+    assert any("line(s) 3 shadow" in w for w in result.warnings)
+    assert "fresh token#one" not in repr(result.warnings)
+    assert "old-later" not in repr(result.warnings)
+
+
+def test_policy_changes_after_preflight_warns_and_preserves_result(rig, monkeypatch):
+    home, cfg, source, mint, read = rig
+    env = home / ".env"
+    env.write_text("BW_SESSION=old\n")
+    baseline = successful_baseline(rig)
+    blocked = Mock(return_value=True)
+    monkeypatch.setattr(core, "_env_write_blocked", blocked)
+    result = source.fetch(cfg, home)
+    blocked.assert_called_once_with("BW_SESSION", "set")
+    assert env.read_text() == "BW_SESSION=old\n"
+    assert_preserved_and_redacted(result, baseline)
+    assert any("not updated" in w.lower() for w in result.warnings)
+
+
+def test_real_validation_refusal_warns_and_preserves_result(rig, monkeypatch):
+    home, cfg, source, mint, read = rig
+    env = home / ".env"
+    env.write_text("BW_SESSION=old\n")
+    baseline = successful_baseline(rig)
+    def reject(key):
+        assert key == "BW_SESSION"
+        raise ValueError("fresh token#one")
+    monkeypatch.setattr(core, "validate_env_var_name_for_write", reject)
+    result = source.fetch(cfg, home)
+    assert env.read_text() == "BW_SESSION=old\n"
+    assert_preserved_and_redacted(result, baseline)
+
+
 def test_real_managed_refusal_warns_without_token(rig, monkeypatch):
     home, cfg, source, mint, read = rig
     env = home / ".env"
     env.write_text("BW_SESSION=old\n")
+    baseline = successful_baseline(rig)
     monkeypatch.setattr(core.managed_scope, "is_env_managed", lambda key: True)
     result = source.fetch(cfg, home)
-    assert result.secrets == {"A": "value"} and not result.error
+    assert_preserved_and_redacted(result, baseline)
     assert env.read_text() == "BW_SESSION=old\n"
     assert any("persist" in w.lower() for w in result.warnings)
     assert "fresh token#one" not in repr(result.warnings)
@@ -91,12 +154,11 @@ def test_real_managed_refusal_warns_without_token(rig, monkeypatch):
 def test_write_failure_warns_without_leaking_and_preserves_cache(rig, monkeypatch):
     home, cfg, source, mint, read = rig
     (home / ".env").write_text("OTHER=yes\n")
+    baseline = successful_baseline(rig)
     def fail(*args): raise OSError("fresh token#one secret")
     monkeypatch.setattr(core, "save_env_value", fail)
     result = source.fetch(cfg, home)
-    assert result.secrets == {"A": "value"} and not result.error
-    assert any("persist" in w.lower() for w in result.warnings)
-    assert "fresh token#one" not in repr(result.warnings)
+    assert_preserved_and_redacted(result, baseline)
     source.fetch(cfg, home)
     assert mint.call_count == 1
 
@@ -106,10 +168,10 @@ def test_mismatched_active_profile_refuses_write(rig, monkeypatch, tmp_path):
     other = tmp_path / "other"
     other.mkdir()
     (other / ".env").write_text("OTHER=yes\n")
+    baseline = successful_baseline(rig)
     monkeypatch.setattr(core, "get_hermes_home", lambda: other)
     result = source.fetch(cfg, home)
-    assert result.secrets == {"A": "value"}
-    assert any("persist" in w.lower() for w in result.warnings)
+    assert_preserved_and_redacted(result, baseline)
     assert (other / ".env").read_text() == "OTHER=yes\n"
 
 

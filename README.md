@@ -64,12 +64,16 @@ never reused by the plugin across processes.
 Optionally set `persist_session_file: true` in auto mode to write a freshly
 minted token only after this fetch proves it with a successful vault read. The
 existing active profile `.env` is updated for ambient consumers, such as other
-tools reading `BW_SESSION`; a missing `.env` is not created. Auto mode still
-ignores this token on later fetches, including in another process, so this is
-not a plugin startup fast path. Cache hits do not rewrite it. Write failures or
-managed-write refusals produce a warning without failing the read. Core's
-writer replaces the first matching assignment (duplicates remain), normalizes
-line endings and whitespace, and may replace a symlink rather than its target.
+tools reading `BW_SESSION`, when there are no duplicate assignments. Later
+duplicates shadow the new token for Hermes readers and produce a warning with
+line numbers. A missing `.env` is not created, except if it is removed between
+the existence check and core's write lock. Auto mode still ignores this token on
+later fetches, including in another process, so this is not a plugin startup fast
+path. Cache hits do not rewrite it. Write failures produce a warning without
+failing the read; the plugin verifies the write and warns when the session line
+was not updated. Core's writer replaces the first matching assignment (duplicates
+remain), normalizes line endings and whitespace, and may replace a symlink rather
+than its target.
 It can also publish the token into the current process environment or routed
 profile scope. Treat the `.env` and its permissions as sensitive.
 
