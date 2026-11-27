@@ -687,7 +687,6 @@ def cmd_reset_auth(args: argparse.Namespace) -> int:
     if binary is None:
         console.print("[red]bw binary not found.[/red]")
         return 1
-    appdata_dir = vw._profile_bw_appdata(get_hermes_home())
     try:
         res = vw._run_bw(binary, "logout", appdata_dir=appdata_dir)
     except RuntimeError as exc:

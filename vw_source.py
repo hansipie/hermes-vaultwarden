@@ -51,6 +51,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import os
 import re
 import shutil
@@ -96,19 +97,27 @@ _BW_ALLOW_ENV = ("NODE_EXTRA_CA_CERTS", "BITWARDENCLI_APPDATA_DIR")
 # their effective values (client ID and secret stripped; master password verbatim).
 # This cache contains session tokens in process memory only, separate from item caches.
 _AUTH_SESSIONS: dict = {}
+# Reset increments a profile generation, fencing publication by older fetches.
+_AUTH_GENERATIONS: dict = {}
+_AUTH_LOCK = threading.RLock()
 
 
 def _clear_auth_sessions(appdata_dir: Path) -> None:
     profile = str(Path(appdata_dir).resolve())
-    for key in list(_AUTH_SESSIONS):
-        if key[0] == profile:
-            _AUTH_SESSIONS.pop(key, None)
+    with _AUTH_LOCK:
+        _AUTH_GENERATIONS[profile] = _AUTH_GENERATIONS.get(profile, 0) + 1
+        for key in list(_AUTH_SESSIONS):
+            if key[0] == profile:
+                _AUTH_SESSIONS.pop(key, None)
 
 
 def _safe_diagnostic(text: str, values) -> str:
     text = scrub_ansi(str(text))
     for value in sorted({str(v) for v in values if v}, key=len, reverse=True):
         text = text.replace(value, "[REDACTED]")
+    # Preserve upstream stderr-or-stdout failure fallback; mask labeled session values.
+    text = re.sub(r"(?i)((?:--session\s+|\bsession\s*[:=]\s*)[\"\']?)([^\s,;\"\']+)", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(\bsession\s+)([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)", r"\1[REDACTED]", text)
     # Tokens are commonly long base64/base64url strings, including padded ones.
     return re.sub(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])", "[REDACTED]", text)
 
@@ -684,7 +693,7 @@ def _run_bw_get_item(
 
 
 def _classify_bw_error(message: str) -> ErrorKind:
-    lowered = (message or "").lower()
+    lowered = scrub_ansi(message or "")[:200].lower()
     if any(
         token in lowered
         for token in (
@@ -994,7 +1003,10 @@ class VaultwardenSource(SecretSource):
                     server_url=str(cfg.get("server_url") or ""),
                 )
 
-            session = _AUTH_SESSIONS.get(auth_key, "") if gate else ""
+            with _AUTH_LOCK:
+                generation = _AUTH_GENERATIONS.get(auth_key[0], 0)
+                session = _AUTH_SESSIONS.get(auth_key, "") if gate else ""
+                expected_session = session or None
             from_cache = bool(session)
             if not session:
                 try:
@@ -1066,12 +1078,12 @@ class VaultwardenSource(SecretSource):
         except RuntimeError as exc:
             kind = _classify_bw_error(str(exc))
             original = _safe_diagnostic(str(exc), sensitive)[:500]
-            # A logged-out profile needs explicit reauthentication/reset, not
-            # an automatic remint; still discard its rejected cached token.
             if gate and from_cache and kind == ErrorKind.AUTH_EXPIRED:
-                _AUTH_SESSIONS.pop(auth_key, None)
-            if not (gate and from_cache and kind == ErrorKind.AUTH_EXPIRED
-                    and "not logged in" not in str(exc).lower()):
+                with _AUTH_LOCK:
+                    if _AUTH_SESSIONS.get(auth_key) == session:
+                        _AUTH_SESSIONS.pop(auth_key, None)
+                        expected_session = None
+            if not (gate and from_cache and kind == ErrorKind.AUTH_EXPIRED):
                 result.error, result.error_kind = original, kind
                 return result
             try:
@@ -1090,7 +1102,10 @@ class VaultwardenSource(SecretSource):
             return result
 
         if gate:
-            _AUTH_SESSIONS[auth_key] = session
+            with _AUTH_LOCK:
+                if (_AUTH_GENERATIONS.get(auth_key[0], 0) == generation
+                        and _AUTH_SESSIONS.get(auth_key) == expected_session):
+                    _AUTH_SESSIONS[auth_key] = session
         warnings = [_safe_diagnostic(w, sensitive) for w in warnings]
 
         result.secrets = secrets
@@ -1105,5 +1120,8 @@ class VaultwardenSource(SecretSource):
 
 def _reset_cache_for_tests(home_path: Optional[Path] = None) -> None:
     _CACHE.clear()
-    _AUTH_SESSIONS.clear()
+    with _AUTH_LOCK:
+        for profile in {key[0] for key in _AUTH_SESSIONS} | set(_AUTH_GENERATIONS):
+            _AUTH_GENERATIONS[profile] = _AUTH_GENERATIONS.get(profile, 0) + 1
+        _AUTH_SESSIONS.clear()
     _DISK_CACHE.clear(home_path)

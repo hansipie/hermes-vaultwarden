@@ -58,7 +58,7 @@ issued for the isolated CLI state. Each Hermes profile gets isolated
 CLI state under `$HERMES_HOME/plugin-data/vaultwarden/bw-cli`, so profiles do
 not share login state. Within one process, a session is reused only after a
 successful vault read. If a cached session expires, the plugin mints once and
-retries the read once (a logged-out CLI state is not retried). Sessions are
+retries the read once, including when the CLI is logged out. Sessions are
 never persisted for reuse across processes.
 Set `remint_on_auth_expired: false` to disable both reuse and recovery; auto
 mode then mints on every fetch. Session mode is unaffected.
