@@ -52,11 +52,33 @@ hermes vaultwarden setup --auto-unlock \
 
 At startup the plugin checks the CLI state, logs in with `bw login --apikey`
 only when unauthenticated, and unlocks with `bw unlock --passwordenv … --raw`.
-The session token remains in process memory; any `BW_SESSION` already present
+By default the session token remains in process memory; any `BW_SESSION` already present
 in the environment is ignored in this mode (with a warning), since it was not
 issued for the isolated CLI state. Each Hermes profile gets isolated
 CLI state under `$HERMES_HOME/plugin-data/vaultwarden/bw-cli`, so profiles do
-not share login state.
+not share login state. Within one process, a session is reused only after a
+successful vault read. If a cached session expires, the plugin mints once and
+retries the read once, including when the CLI is logged out. Sessions are
+never reused by the plugin across processes.
+
+Optionally set `persist_session_file: true` in auto mode to write a freshly
+minted token only after this fetch proves it with a successful vault read. The
+existing active profile `.env` is updated for ambient consumers, such as other
+tools reading `BW_SESSION`, when there are no duplicate assignments. Later
+duplicates shadow the new token for Hermes readers and produce a warning with
+line numbers. A missing `.env` is not created, except if it is removed between
+the existence check and core's write lock. Auto mode still ignores this token on
+later fetches, including in another process, so this is not a plugin startup fast
+path. Cache hits do not rewrite it. Write failures produce a warning without
+failing the read; the plugin verifies the write and warns when the session line
+was not updated. Core's writer replaces the first matching assignment (duplicates
+remain), normalizes line endings and whitespace, and may replace a symlink rather
+than its target.
+It can also publish the token into the current process environment or routed
+profile scope. Treat the `.env` and its permissions as sensitive.
+
+Set `remint_on_auth_expired: false` to disable both reuse and recovery; auto
+mode then mints on every fetch. Session mode is unaffected.
 
 Unattended mode requires an explicit HTTPS `server_url` and verifies that the
 CLI persisted it before sending credentials. Sandboxed wrappers that cannot
@@ -116,7 +138,9 @@ clears it from `config.yaml`.
 |---|---|---|
 | `enabled` | `false` | Master switch |
 | `session_env` | `BW_SESSION` | Env var holding the `bw unlock --raw` token |
-| `auto_unlock` | `false` | Mint a memory-only session from personal API-key credentials (`session_env` is then ignored) |
+| `auto_unlock` | `false` | Mint a session from personal API-key credentials (`session_env` is then ignored) |
+| `remint_on_auth_expired` | `true` | Reuse proven in-memory auto-unlock sessions and retry once after expiry |
+| `persist_session_file` | `false` | Opt in to writing freshly minted, proven auto-unlock sessions to an existing profile `.env` for ambient consumers |
 | `client_id_env` | `BW_CLIENTID` | Name of the personal API-key client-ID env var |
 | `client_secret_env` | `BW_CLIENTSECRET` | Name of the personal API-key client-secret env var |
 | `master_password_env` | `BW_MASTER_PASSWORD` | Name of the master-password env var |

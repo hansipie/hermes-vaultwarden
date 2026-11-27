@@ -608,7 +608,9 @@ class TestVaultwardenSourceFetch:
     def test_session_stripped_from_child_env(self, monkeypatch):
         # Hermes builds its spawn blocklist from every registered source's
         # token_env({}) — BW_SESSION must be in it once we're registered.
-        from tools.environments import local_env_policy
+        local_env_policy = pytest.importorskip("tools.environments.local_env_policy")
+        if not hasattr(local_env_policy, "_secret_source_bootstrap_env"):
+            pytest.skip("Hermes private bootstrap-env helper is not available")
 
         monkeypatch.setattr(
             "agent.secret_sources.registry.list_sources", lambda: [self.source]
