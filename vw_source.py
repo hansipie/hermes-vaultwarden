@@ -15,7 +15,7 @@ Design summary
   → ``PATH``.
 * Interactive use can provide a ``BW_SESSION`` token.  Unattended use can
   mint one in memory from a personal API key plus the account master
-  password.  Auto-unlock never persists the session token, ignores any
+  password.  Auto-unlock can optionally persist a proven token, ignores any
   ``BW_SESSION`` from the environment, and isolates the ``bw`` data
   directory beneath the active Hermes home.
 * Secrets come from a single named vault item.  On every cache miss the
@@ -35,8 +35,8 @@ Design summary
   ``login.password`` and ``notes`` are *not* custom fields and are only
   exported when the user opts in via ``username_env`` / ``password_env``
   / ``notes_env`` — there's no default name to guess, so silence beats a
-  wrong guess.  :meth:`VaultwardenSource.fetch` never writes
-  ``os.environ`` itself.
+  wrong guess.  Opt-in persistence may publish the session to
+  ``os.environ`` or the current routed profile scope through Hermes core.
 * Caching is disabled by default because it stores resolved plaintext secret
   values.  When explicitly enabled it is two-layer (in-process dict + disk
   JSON via the shared
@@ -883,14 +883,17 @@ class VaultwardenSource(SecretSource):
                     "When true, authenticate with a personal API key and mint a "
                     "session in memory for the profile-isolated bw state. "
                     "session_env is ignored in this mode (a token from .env was "
-                    "never issued for the isolated state). The token is never "
-                    "persisted."
+                    "never issued for the isolated state). Persistence is opt-in."
                 ),
                 "default": False,
             },
             "remint_on_auth_expired": {
                 "description": "Reuse proven in-memory sessions and retry once on expiry in auto-unlock mode; false mints on every fetch",
                 "default": True,
+            },
+            "persist_session_file": {
+                "description": "Write freshly minted, proven auto-unlock tokens to an existing profile .env for ambient consumers; auto-unlock still ignores that token",
+                "default": False,
             },
             "client_id_env": {
                 "description": "Env var holding the personal API-key client ID",
@@ -996,6 +999,7 @@ class VaultwardenSource(SecretSource):
         gate = auto_unlock and bool(cfg.get("remint_on_auth_expired", True))
         auth_key = None
         from_cache = False
+        minted_this_call = False
         credential_names = (
             str(cfg.get("client_id_env") or _DEFAULT_CLIENT_ID_ENV).strip(),
             str(cfg.get("client_secret_env") or _DEFAULT_CLIENT_SECRET_ENV).strip(),
@@ -1035,6 +1039,7 @@ class VaultwardenSource(SecretSource):
             if not session:
                 try:
                     session = _mint()
+                    minted_this_call = True
                     result.warnings.append("auto_unlock: minted an in-memory session")
                 except RuntimeError as exc:
                     result.error_kind = _classify_bw_error(str(exc))
@@ -1098,7 +1103,10 @@ class VaultwardenSource(SecretSource):
             return fetch_vaultwarden_secrets(**kwargs)
 
         try:
-            secrets, warnings = _read(session, force_read=gate and not from_cache)
+            force_read = auto_unlock and not from_cache and (
+                gate or bool(cfg.get("persist_session_file", False))
+            )
+            secrets, warnings = _read(session, force_read=force_read)
         except RuntimeError as exc:
             kind = _classify_bw_error(str(exc))
             original = _safe_diagnostic(str(exc), sensitive, session_env)[:500]
@@ -1112,6 +1120,7 @@ class VaultwardenSource(SecretSource):
                 return result
             try:
                 session = _mint()
+                minted_this_call = True
                 sensitive.append(session)
                 secrets, warnings = _read(session, force_read=True)
                 result.warnings.append("remint_on_auth_expired: read retried with an in-memory session")
@@ -1131,6 +1140,24 @@ class VaultwardenSource(SecretSource):
                         and _AUTH_GENERATIONS.get(auth_key[0], 0) == generation
                         and _AUTH_SESSIONS.get(auth_key) == expected_session):
                     _AUTH_SESSIONS[auth_key] = session
+        # Only this call's freshly minted token, proven by a real vault read,
+        # is eligible. Cached-token reads do not repeatedly rewrite the file.
+        if auto_unlock and minted_this_call and cfg.get("persist_session_file", False):
+            try:
+                from hermes_cli.config import get_env_path, require_env_writable, save_env_value
+
+                env_path = get_env_path()  # Honors the routed profile-home override.
+                if env_path.parent.resolve() != Path(home_path).resolve():
+                    result.warnings.append("persist_session_file: active profile mismatch; session not persisted")
+                elif env_path.exists():
+                    # The helper silently refuses managed writes; check first for a warning.
+                    require_env_writable(session_env, "set")
+                    # Core may publish to os.environ or the routed scope. This is
+                    # intentional when opted in, not a memory-only guarantee.
+                    save_env_value(session_env, session)
+                # Missing files are deliberately not created.
+            except Exception:  # best effort; never expose exception text or token
+                result.warnings.append("persist_session_file: could not persist the session")
         warnings = [_safe_diagnostic(w, sensitive, session_env) for w in warnings]
 
         result.secrets = secrets
