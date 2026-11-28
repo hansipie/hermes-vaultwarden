@@ -605,17 +605,40 @@ class TestVaultwardenSourceFetch:
         assert self.source.token_env({"session_env": "MY_BW_TOKEN"}) == "MY_BW_TOKEN"
         assert self.source.token_env({"session_env": "not a name"}) == "BW_SESSION"
 
-    def test_session_stripped_from_child_env(self, monkeypatch):
-        # Hermes builds its spawn blocklist from every registered source's
-        # token_env({}) — BW_SESSION must be in it once we're registered.
-        local_env_policy = pytest.importorskip("tools.environments.local_env_policy")
-        if not hasattr(local_env_policy, "_secret_source_bootstrap_env"):
-            pytest.skip("Hermes private bootstrap-env helper is not available")
+    def test_session_stripped_from_child_env(self, tmp_path):
+        # Security guarantee: once this source is registered, Hermes strips its
+        # bootstrap token (token_env -> BW_SESSION) from spawned children.
+        # Checked end to end through the public hermes_subprocess_env() in a
+        # fresh interpreter, mirroring startup (plugin registered, then the
+        # spawn policy imported).  Never skipped: if Hermes renames the API or
+        # stops stripping the token, this must fail loudly (issue #11).
+        import os
+        import sys
+        import textwrap
 
-        monkeypatch.setattr(
-            "agent.secret_sources.registry.list_sources", lambda: [self.source]
+        probe = textwrap.dedent("""
+            import json
+            from agent.secret_sources import registry
+            import vw_source as vw
+            registry.register_source(vw.VaultwardenSource())
+            from tools.environments.local import hermes_subprocess_env
+            base = {"BW_SESSION": "probe-token", "KEEP_ME": "1"}
+            print(json.dumps(sorted(hermes_subprocess_env(base_env=base))))
+        """)
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(tmp_path),
+            "HERMES_HOME": str(tmp_path / ".hermes"),
+            "PYTHONPATH": os.pathsep.join(p for p in sys.path if p),
+        }
+        proc = subprocess.run(
+            [sys.executable, "-c", probe], env=env, cwd=tmp_path,
+            capture_output=True, text=True, timeout=120,
         )
-        assert "BW_SESSION" in local_env_policy._secret_source_bootstrap_env()
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        child_env = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert "KEEP_ME" in child_env, "probe is not exercising the real scrub"
+        assert "BW_SESSION" not in child_env
 
     def test_protected_env_vars_follows_config(self):
         defaults = {
