@@ -188,7 +188,7 @@ def _safe_diagnostic(
     )
 
 
-def cli_safe_error(exc: BaseException, session: str = "") -> str:
+def cli_safe_error(exc: object, session: str = "") -> str:
     """Redacted, bounded rendering of an exception for direct CLI callers.
 
     ``mint_session`` and ``fetch_vaultwarden_secrets`` raise with full bw
