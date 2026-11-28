@@ -52,19 +52,26 @@ secret-tool store --label="BW client secret" service hermes-bw key BW_CLIENTSECR
 secret-tool store --label="BW master pw"     service hermes-bw key BW_MASTER_PASSWORD
 ```
 
-Then wrap `hermes` in a shell function, for example in `~/.bashrc`:
+Then tell the plugin how to read them with `credentials_command`. It is set
+once, and the same setting serves the gateway service, `hermes` commands run
+from your shell and `hermes vaultwarden setup`:
 
 ```bash
-hermes() {
-  BW_CLIENTID="$(secret-tool lookup service hermes-bw key BW_CLIENTID)" \
-  BW_CLIENTSECRET="$(secret-tool lookup service hermes-bw key BW_CLIENTSECRET)" \
-  BW_MASTER_PASSWORD="$(secret-tool lookup service hermes-bw key BW_MASTER_PASSWORD)" \
-  command hermes "$@"
-}
+hermes vaultwarden setup --auto-unlock \
+  --server-url https://your-vaultwarden.example.com \
+  --item-id '<vault-item-uuid>' \
+  --credentials-command 'id=$(secret-tool lookup service hermes-bw key BW_CLIENTID) && sec=$(secret-tool lookup service hermes-bw key BW_CLIENTSECRET) && pw=$(secret-tool lookup service hermes-bw key BW_MASTER_PASSWORD) && printf "BW_CLIENTID=%s\nBW_CLIENTSECRET=%s\nBW_MASTER_PASSWORD=%s\n" "$id" "$sec" "$pw"'
 ```
 
-The variables exist only for the `hermes` process. Nothing is written to disk
-in clear text, and they stay out of your shell's environment.
+Setup saves the command in `config.yaml`. The plugin runs it at each startup
+and keeps the values in its own memory only: they are not written to disk,
+the Hermes `.env` or the process environment. Chaining the lookups with `&&`
+makes a missing entry fail clearly instead of passing an empty value. The
+keyring must be unlocked (it is while your desktop session is open).
+
+A value already present in the environment still takes precedence, so you
+don't need a shell wrapper that exports the three variables any more. See
+the README section on `credentials_command` for details.
 
 **2. A systemd service (gateway, start at boot).** Use
 `LoadCredentialEncrypted=` with `systemd-creds encrypt` rather than

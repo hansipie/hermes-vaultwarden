@@ -458,6 +458,32 @@ def run_credentials_command(
     return values
 
 
+def resolve_auto_unlock_credentials(
+    names, env: Mapping[str, str], command: object = "", timeout: object = None
+) -> Tuple[Dict[str, str], List[str]]:
+    """Auto-unlock credential values for ``names``, shared by fetch() and setup.
+
+    ``env`` wins; ``command`` (``credentials_command``) runs only when a name
+    is missing and fills just those.  Returns ``(values, filled_names)`` where
+    ``filled_names`` came from the command.  Raises RuntimeError from the
+    helper (structured message, never a value).  Nothing is written anywhere.
+    """
+    values = {name: str(env.get(name) or "") for name in names}
+    filled: List[str] = []
+    command = str(command or "").strip()
+    if command and not all(values.values()):
+        try:
+            seconds = float(timeout) if timeout is not None else _CRED_CMD_TIMEOUT
+        except (TypeError, ValueError):
+            seconds = _CRED_CMD_TIMEOUT
+        from_command = run_credentials_command(command, names, timeout=seconds)
+        for name in names:
+            if not values[name] and from_command.get(name):
+                values[name] = from_command[name]
+                filled.append(name)
+    return values, filled
+
+
 def _run_bw(
     binary: Path,
     *args: str,
@@ -1172,30 +1198,20 @@ class VaultwardenSource(SecretSource):
                 )
                 result.error_kind = ErrorKind.BINARY_MISSING
                 return result
-            credentials_command = str(cfg.get("credentials_command") or "").strip()
-            if credentials_command and not all(credential_values):
-                # Fill only the names the environment does not provide, so an
-                # explicit .env/shell value keeps precedence (Hermes' default).
-                try:
-                    timeout = float(cfg.get("credentials_command_timeout_seconds", _CRED_CMD_TIMEOUT))
-                except (TypeError, ValueError):
-                    timeout = _CRED_CMD_TIMEOUT
-                try:
-                    from_command = run_credentials_command(
-                        credentials_command, credential_names, timeout=timeout
-                    )
-                except RuntimeError as exc:
-                    result.error = str(exc)
-                    result.error_kind = (
-                        ErrorKind.TIMEOUT if "timed out" in str(exc) else ErrorKind.NOT_CONFIGURED
-                    )
-                    return result
-                credential_values = [
-                    value or from_command.get(name, "")
-                    for name, value in zip(credential_names, credential_values)
-                ]
-                sensitive.extend(credential_values)
-            credentials_env = dict(zip(credential_names, credential_values))
+            try:
+                credentials_env, _filled = resolve_auto_unlock_credentials(
+                    credential_names, source_env,
+                    cfg.get("credentials_command"),
+                    cfg.get("credentials_command_timeout_seconds"),
+                )
+            except RuntimeError as exc:
+                result.error = str(exc)
+                result.error_kind = (
+                    ErrorKind.TIMEOUT if "timed out" in str(exc) else ErrorKind.NOT_CONFIGURED
+                )
+                return result
+            credential_values = [credentials_env[name] for name in credential_names]
+            sensitive.extend(credential_values)
             effective = [credential_values[0].strip(), credential_values[1].strip(), credential_values[2]]
             sensitive.extend(effective)
             auth_key = (str(appdata_dir.resolve()), str(Path(binary0).resolve()),

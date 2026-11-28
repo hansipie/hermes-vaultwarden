@@ -36,6 +36,7 @@ def _setup_args(**overrides) -> argparse.Namespace:
         "username_env": None,
         "password_env": None,
         "notes_env": None,
+        "credentials_command": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -403,3 +404,92 @@ def test_reset_auth_failure_redacts_and_escapes(monkeypatch, tmp_path):
     out = console.export_text()
     assert "client-secret-value" not in out
     assert "bw logout failed: [/x] [REDACTED]" in out
+
+
+# --- setup --auto-unlock resolves credentials like fetch() (credentials_command) ---
+
+import sys as _sys
+
+_HELPER = (
+    f"{_sys.executable} -c \"print('BW_CLIENTID=cid-h'); "
+    "print('BW_CLIENTSECRET=sec-h'); print('BW_MASTER_PASSWORD=pw-h')\""
+)
+
+
+def _auto_setup(monkeypatch, tmp_path, config, env=None):
+    _configure_setup(monkeypatch, config)
+    monkeypatch.setattr(cli, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(vw, "get_source_environment", lambda: dict(env or {}))
+    mint = mock.Mock(return_value="minted")
+    monkeypatch.setattr(vw, "mint_session", mint)
+    console = _recording_console()
+    monkeypatch.setattr(cli, "Console", lambda: console)
+    return mint, console
+
+
+def test_setup_uses_configured_credentials_command(monkeypatch, tmp_path):
+    config = {"secrets": {"vaultwarden": {"credentials_command": _HELPER}}}
+    mint, console = _auto_setup(monkeypatch, tmp_path, config)
+    assert cli.cmd_setup(_setup_args(auto_unlock=True, server_url="https://vault.example.com")) == 0
+    assert mint.call_args.kwargs["credentials_env"] == {
+        "BW_CLIENTID": "cid-h", "BW_CLIENTSECRET": "sec-h", "BW_MASTER_PASSWORD": "pw-h"}
+    out = console.export_text()
+    assert "credentials from credentials_command: BW_CLIENTID, BW_CLIENTSECRET, BW_MASTER_PASSWORD" in out
+    assert not any(v in out for v in ("cid-h", "sec-h", "pw-h"))
+    assert config["secrets"]["vaultwarden"]["credentials_command"] == _HELPER
+
+
+def test_setup_flag_is_used_and_saved(monkeypatch, tmp_path):
+    config = {"secrets": {"vaultwarden": {}}}
+    mint, _ = _auto_setup(monkeypatch, tmp_path, config)
+    args = _setup_args(auto_unlock=True, server_url="https://vault.example.com",
+                       credentials_command=_HELPER)
+    assert cli.cmd_setup(args) == 0
+    assert mint.call_args.kwargs["credentials_env"]["BW_MASTER_PASSWORD"] == "pw-h"
+    assert config["secrets"]["vaultwarden"]["credentials_command"] == _HELPER
+
+
+def test_setup_empty_flag_removes_configured_helper(monkeypatch, tmp_path):
+    config = {"secrets": {"vaultwarden": {"credentials_command": _HELPER}}}
+    env = {"BW_CLIENTID": "e1", "BW_CLIENTSECRET": "e2", "BW_MASTER_PASSWORD": "e3"}
+    _auto_setup(monkeypatch, tmp_path, config, env)
+    args = _setup_args(auto_unlock=True, server_url="https://vault.example.com",
+                       credentials_command="")
+    assert cli.cmd_setup(args) == 0
+    assert "credentials_command" not in config["secrets"]["vaultwarden"]
+
+
+def test_setup_environment_wins_and_helper_not_run(monkeypatch, tmp_path):
+    config = {"secrets": {"vaultwarden": {"credentials_command": _HELPER}}}
+    env = {"BW_CLIENTID": "e1", "BW_CLIENTSECRET": "e2", "BW_MASTER_PASSWORD": "e3"}
+    mint, console = _auto_setup(monkeypatch, tmp_path, config, env)
+    runner = mock.Mock()
+    monkeypatch.setattr(vw, "run_credentials_command", runner)
+    assert cli.cmd_setup(_setup_args(auto_unlock=True, server_url="https://vault.example.com")) == 0
+    runner.assert_not_called()
+    assert mint.call_args.kwargs["credentials_env"] == env
+    assert "credentials from credentials_command" not in console.export_text()
+
+
+def test_setup_helper_failure_aborts_without_saving(monkeypatch, tmp_path):
+    failing = f"{_sys.executable} -c \"import sys; sys.stderr.write('pw-h'); sys.exit(2)\""
+    config = {"secrets": {"vaultwarden": {"credentials_command": failing}}}
+    mint, console = _auto_setup(monkeypatch, tmp_path, config)
+    assert cli.cmd_setup(_setup_args(auto_unlock=True, server_url="https://vault.example.com")) == 1
+    mint.assert_not_called()
+    cli.save_config.assert_not_called()
+    out = console.export_text()
+    assert "credentials_command failed: exit code 2" in out and "pw-h" not in out
+
+
+def test_setup_honors_configured_credential_names(monkeypatch, tmp_path):
+    helper = f"{_sys.executable} -c \"print('MY_ID=i'); print('MY_SECRET=s'); print('MY_PW=p')\""
+    config = {"secrets": {"vaultwarden": {
+        "credentials_command": helper, "client_id_env": "MY_ID",
+        "client_secret_env": "MY_SECRET", "master_password_env": "MY_PW"}}}
+    mint, _ = _auto_setup(monkeypatch, tmp_path, config)
+    assert cli.cmd_setup(_setup_args(auto_unlock=True, server_url="https://vault.example.com")) == 0
+    kw = mint.call_args.kwargs
+    assert (kw["client_id_env"], kw["client_secret_env"], kw["master_password_env"]) == (
+        "MY_ID", "MY_SECRET", "MY_PW")
+    assert kw["credentials_env"] == {"MY_ID": "i", "MY_SECRET": "s", "MY_PW": "p"}

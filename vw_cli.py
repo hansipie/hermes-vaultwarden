@@ -71,6 +71,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Use BW_CLIENTID/BW_CLIENTSECRET/BW_MASTER_PASSWORD at startup",
     )
+    setup.add_argument(
+        "--credentials-command",
+        help=(
+            "Auto-unlock only: helper printing KEY=VALUE credential lines "
+            "(e.g. secret-tool lookup), used for names the environment lacks "
+            "and saved as secrets.vaultwarden.credentials_command. Omit to keep "
+            "the configured one; pass '' to remove it"
+        ),
+    )
     setup.add_argument("--item-id", help="Immutable vault item ID (preferred)")
     setup.add_argument(
         "--server-url",
@@ -226,11 +235,38 @@ def cmd_setup(args: argparse.Namespace) -> int:
     session = ""
     appdata_dir = None
     if args.auto_unlock:
+        # Same resolution as fetch(): environment first, then the helper
+        # (--credentials-command, else the configured one) for missing names.
+        flag_command = getattr(args, "credentials_command", None)
+        credentials_command = (
+            flag_command if flag_command is not None
+            else secrets_cfg.get("credentials_command")
+        )
         try:
+            names = (
+                vw._safe_env_name(secrets_cfg.get("client_id_env"),
+                                  vw._DEFAULT_CLIENT_ID_ENV, "client_id_env"),
+                vw._safe_env_name(secrets_cfg.get("client_secret_env"),
+                                  vw._DEFAULT_CLIENT_SECRET_ENV, "client_secret_env"),
+                vw._safe_env_name(secrets_cfg.get("master_password_env"),
+                                  vw._DEFAULT_MASTER_PASSWORD_ENV, "master_password_env"),
+            )
+            credentials_env, filled = vw.resolve_auto_unlock_credentials(
+                names, vw.get_source_environment(), credentials_command,
+                secrets_cfg.get("credentials_command_timeout_seconds"),
+            )
+            if filled:
+                console.print(
+                    "  credentials from credentials_command: " + ", ".join(filled)
+                )
             session = vw.mint_session(
                 binary,
                 home_path=get_hermes_home(),
+                client_id_env=names[0],
+                client_secret_env=names[1],
+                master_password_env=names[2],
                 server_url=server_url,
+                credentials_env=credentials_env,
             )
             appdata_dir = vw._profile_bw_appdata(get_hermes_home())
         except RuntimeError as exc:
@@ -399,6 +435,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # targets from spawned children only when config.yaml names them.
         for key, default in vw.credential_pointer_defaults().items():
             secrets_cfg.setdefault(key, default)
+        # Omitted flag keeps the configured helper; an explicit '' removes it.
+        flag_command = getattr(args, "credentials_command", None)
+        if flag_command is not None:
+            if flag_command.strip():
+                secrets_cfg["credentials_command"] = flag_command.strip()
+            else:
+                secrets_cfg.pop("credentials_command", None)
     if server_url:
         secrets_cfg["server_url"] = server_url
     secrets_cfg.setdefault("session_env", session_env)
