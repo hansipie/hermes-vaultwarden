@@ -233,7 +233,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
             )
             appdata_dir = vw._profile_bw_appdata(get_hermes_home())
         except RuntimeError as exc:
-            console.print(f"  [red]Unattended authentication failed: {exc}[/red]")
+            console.print(
+                f"  [red]Unattended authentication failed: {vw.cli_safe_error(exc)}[/red]"
+            )
             return 1
         console.print("  [green]✓[/green] API-key login and in-memory unlock succeeded")
     else:
@@ -355,7 +357,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             appdata_dir=appdata_dir,
         )
     except Exception as exc:  # noqa: BLE001
-        console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
+        console.print(f"  [red]✗ Fetch failed: {vw.cli_safe_error(exc, session)}[/red]")
         return 1
 
     if not secrets:
@@ -681,23 +683,24 @@ def cmd_reset_auth(args: argparse.Namespace) -> int:
     console = Console()
     cfg = load_config()
     vw_cfg = (cfg.get("secrets") or {}).get("vaultwarden") or {}
-    binary = vw.find_bw(vw_cfg.get("binary_path"))
-    if binary is None:
-        console.print("[red]bw binary not found.[/red]")
-        return 1
     appdata_dir = vw._profile_bw_appdata(get_hermes_home())
-    try:
-        res = vw._run_bw(binary, "logout", appdata_dir=appdata_dir)
-    except RuntimeError as exc:
-        console.print(f"[red]Could not reset profile authentication: {exc}[/red]")
-        return 1
-    if res.returncode != 0:
-        err = (res.stderr or res.stdout or "").strip()[:200]
-        if "not logged in" not in err.lower():
-            console.print(f"[red]bw logout failed: {err}[/red]")
+    with vw._reset_auth_transaction(appdata_dir):
+        binary = vw.find_bw(vw_cfg.get("binary_path"))
+        if binary is None:
+            console.print("[red]bw binary not found.[/red]")
             return 1
-    console.print("[green]Profile authentication reset.[/green] No vault items were changed.")
-    return 0
+        try:
+            res = vw._run_bw(binary, "logout", appdata_dir=appdata_dir)
+        except RuntimeError as exc:
+            console.print(f"[red]Could not reset profile authentication: {exc}[/red]")
+            return 1
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()[:200]
+            if "not logged in" not in err.lower():
+                console.print(f"[red]bw logout failed: {err}[/red]")
+                return 1
+        console.print("[green]Profile authentication reset.[/green] No vault items were changed.")
+        return 0
 
 
 # ---------------------------------------------------------------------------

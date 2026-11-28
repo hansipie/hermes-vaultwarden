@@ -608,7 +608,9 @@ class TestVaultwardenSourceFetch:
     def test_session_stripped_from_child_env(self, monkeypatch):
         # Hermes builds its spawn blocklist from every registered source's
         # token_env({}) — BW_SESSION must be in it once we're registered.
-        from tools.environments import local_env_policy
+        local_env_policy = pytest.importorskip("tools.environments.local_env_policy")
+        if not hasattr(local_env_policy, "_secret_source_bootstrap_env"):
+            pytest.skip("Hermes private bootstrap-env helper is not available")
 
         monkeypatch.setattr(
             "agent.secret_sources.registry.list_sources", lambda: [self.source]
@@ -642,6 +644,10 @@ class TestVaultwardenSourceFetch:
         ("bw unlock failed: Invalid master password", ErrorKind.AUTH_FAILED),
         ("auto_unlock requires an explicit secrets.vaultwarden.server_url", ErrorKind.NOT_CONFIGURED),
         ("bw exited 1: Not found.", ErrorKind.REF_INVALID),
+        ("bw exited 1: item session-backup not found", ErrorKind.REF_INVALID),
+        ("bw exited 1: item locked-notes not found", ErrorKind.REF_INVALID),
+        ("bw exited 1: more than one result for unlock-keys", ErrorKind.REF_INVALID),
+        ("bw exited 1: You are not logged in. Item not found", ErrorKind.AUTH_EXPIRED),
         ("bw exited 1: connection refused", ErrorKind.NETWORK),
         ("bw returned non-JSON output: x", ErrorKind.INTERNAL),
     ],
