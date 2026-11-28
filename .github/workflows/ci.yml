@@ -1,0 +1,24 @@
+# Blocking CI: tests against a pinned hermes-agent commit so results only
+# change when this repo changes. Bump HERMES_AGENT_REF deliberately (the
+# weekly hermes-main workflow tells you when upstream drifts).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+    with:
+      # NousResearch/hermes-agent main, 2026-11-19
+      hermes_ref: caafe5389ae585ef77387a962aee05b1bcf17029

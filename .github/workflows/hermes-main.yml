@@ -1,0 +1,18 @@
+# Non-blocking canary: weekly run against hermes-agent's moving main to catch
+# upstream changes that would break the plugin before the pinned CI ref is
+# bumped. Not a required status check; a failure here never blocks a merge.
+name: hermes-agent main (weekly)
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+    with:
+      hermes_ref: main
