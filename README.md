@@ -86,12 +86,18 @@ secrets:
   vaultwarden:
     auto_unlock: true
     credentials_command: >-
-      printf 'BW_CLIENTID=%s\nBW_CLIENTSECRET=%s\nBW_MASTER_PASSWORD=%s\n'
-      "$(secret-tool lookup service vaultwarden key client_id)"
-      "$(secret-tool lookup service vaultwarden key client_secret)"
-      "$(secret-tool lookup service vaultwarden key master_password)"
+      id=$(secret-tool lookup service hermes-bw key BW_CLIENTID) &&
+      sec=$(secret-tool lookup service hermes-bw key BW_CLIENTSECRET) &&
+      pw=$(secret-tool lookup service hermes-bw key BW_MASTER_PASSWORD) &&
+      printf 'BW_CLIENTID=%s\nBW_CLIENTSECRET=%s\nBW_MASTER_PASSWORD=%s\n' "$id" "$sec" "$pw"
 ```
 
+- Store the entries once with `secret-tool store --label=… service hermes-bw key BW_CLIENTID`
+  (and likewise for the other two). The value is read without echo. Chaining the
+  lookups with `&&` makes a missing entry fail clearly instead of passing an empty value.
+- `hermes vaultwarden setup --auto-unlock --credentials-command '…'` uses the helper
+  for its own login test and saves it. Without the flag, setup reuses the configured
+  command, and `--credentials-command ''` removes it.
 - It runs only in auto-unlock mode, and only when the environment lacks one of
   the three names (an explicit `.env`/shell value keeps precedence). Output
   names other than the configured `client_id_env` / `client_secret_env` /
