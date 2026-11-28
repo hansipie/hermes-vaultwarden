@@ -74,6 +74,37 @@ For system services, inject the three bootstrap variables with your service
 manager's secret/credential facility. Do not put values in unit files or
 `config.yaml`.
 
+#### From a keyring or password manager (`credentials_command`)
+
+To keep the three values out of `.env` and the service environment, let the
+plugin ask a helper for them. The helper is a fast, non-interactive command
+run via `/bin/sh -c` that prints `KEY=VALUE` lines, for example from the
+desktop keyring with `secret-tool`:
+
+```yaml
+secrets:
+  vaultwarden:
+    auto_unlock: true
+    credentials_command: >-
+      printf 'BW_CLIENTID=%s\nBW_CLIENTSECRET=%s\nBW_MASTER_PASSWORD=%s\n'
+      "$(secret-tool lookup service vaultwarden key client_id)"
+      "$(secret-tool lookup service vaultwarden key client_secret)"
+      "$(secret-tool lookup service vaultwarden key master_password)"
+```
+
+- It runs only in auto-unlock mode, and only when the environment lacks one of
+  the three names (an explicit `.env`/shell value keeps precedence). Output
+  names other than the configured `client_id_env` / `client_secret_env` /
+  `master_password_env` are ignored.
+- Values stay in the plugin's memory just long enough to mint and fingerprint
+  the session. They are never written to `.env`, `os.environ` or disk, and
+  they are redacted from diagnostics.
+- The helper's stderr is discarded. Failures report only an exit code or a
+  timeout (`credentials_command_timeout_seconds`, default 5 s). The keyring
+  must already be unlocked: a prompt cannot be answered.
+- The command string lives in `config.yaml`, so it must not contain secrets
+  itself. A rotated value in the keyring triggers a fresh mint on the next fetch.
+
 If the Vaultwarden endpoint uses a private CA, set `NODE_EXTRA_CA_CERTS` to its
 PEM certificate path. The plugin passes only that standard trust-path variable
 to `bw`; it never disables TLS verification.
@@ -123,6 +154,8 @@ clears it from `config.yaml`.
 | `session_env` | `BW_SESSION` | Env var holding the `bw unlock --raw` token |
 | `auto_unlock` | `false` | Mint a memory-only session from personal API-key credentials (`session_env` is then ignored) |
 | `remint_on_auth_expired` | `true` | Reuse proven in-memory auto-unlock sessions and retry once after expiry |
+| `credentials_command` | `""` | Auto-unlock helper printing `KEY=VALUE` credential lines (e.g. `secret-tool lookup`); fills names missing from the environment, in memory only |
+| `credentials_command_timeout_seconds` | `5` | Hard timeout for one `credentials_command` run |
 | `client_id_env` | `BW_CLIENTID` | Name of the personal API-key client-ID env var |
 | `client_secret_env` | `BW_CLIENTSECRET` | Name of the personal API-key client-secret env var |
 | `master_password_env` | `BW_MASTER_PASSWORD` | Name of the master-password env var |

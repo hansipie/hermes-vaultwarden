@@ -54,11 +54,13 @@ import json
 import logging
 import threading
 import os
+import signal
+import subprocess
 import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from agent.secret_sources._cache import CachedFetch, DiskCache, resolve_cache_home
 from agent.secret_sources.base import (
@@ -387,6 +389,75 @@ def _safe_env_name(value: object, default: str, config_key: str) -> str:
     return candidate
 
 
+# credentials_command: a user-configured, non-interactive helper (secret-tool,
+# pass, keepassxc-cli, ...) that prints the auto-unlock credentials as
+# KEY=VALUE lines.  Values stay in this process's memory: never written to
+# .env, os.environ or disk, and never logged.  Semantics mirror Hermes' own
+# ``command`` secret source (which cannot serve these values: apply_all
+# fetches every source before applying any, and these names are protected).
+_CRED_CMD_TIMEOUT = 5.0
+_CRED_CMD_MAX_OUTPUT = 64 * 1024
+_CRED_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+def _credential_command_env() -> Dict[str, str]:
+    # Same environment Hermes gives its own command helper (the user's env,
+    # e.g. DBUS_SESSION_BUS_ADDRESS for secret-tool); per-profile under multiplex.
+    try:
+        from agent.secret_sources.base import source_child_env
+        return dict(source_child_env())
+    except Exception:  # older Hermes without the helper
+        return dict(get_source_environment())
+
+
+def run_credentials_command(
+    command: str, names, *, timeout: float = _CRED_CMD_TIMEOUT
+) -> Dict[str, str]:
+    """Run ``command`` via ``/bin/sh -c`` and return the requested ``names``.
+
+    Only names in ``names`` are kept; everything else in the output is
+    ignored.  stderr is discarded and failures report structured fields
+    only (exit code, timeout), never the command, its output or a value.
+    A value is used verbatim except for one layer of matching surrounding
+    quotes, so leading/trailing spaces in a master password survive.
+    """
+    if os.name == "nt":
+        raise RuntimeError("credentials_command is POSIX-only (needs /bin/sh)")
+    wanted = set(names)
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", command], env=_credential_command_env(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"credentials_command failed to start: errno={exc.errno}") from None
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        proc.communicate()
+        raise RuntimeError(f"credentials_command timed out after {timeout:g}s") from None
+    if proc.returncode != 0:
+        raise RuntimeError(f"credentials_command failed: exit code {proc.returncode}")
+    if len(out) > _CRED_CMD_MAX_OUTPUT:
+        raise RuntimeError("credentials_command output exceeded the size cap")
+    values: Dict[str, str] = {}
+    for line in out.decode("utf-8", errors="replace").split("\n"):
+        m = _CRED_LINE.match(line.rstrip("\r"))
+        if not m or m.group(1) not in wanted:
+            continue
+        value = m.group(2)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            values[m.group(1)] = value
+    return values
+
+
 def _run_bw(
     binary: Path,
     *args: str,
@@ -492,6 +563,7 @@ def mint_session(
     client_secret_env: str = _DEFAULT_CLIENT_SECRET_ENV,
     master_password_env: str = _DEFAULT_MASTER_PASSWORD_ENV,
     server_url: str = "",
+    credentials_env: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Mint a ``bw`` session without prompts or persistent session tokens.
 
@@ -500,6 +572,10 @@ def mint_session(
     directory beneath ``home_path`` so Hermes profiles cannot race or inherit
     one another's Bitwarden state.  Credential values travel only in the child
     environment and the returned session exists only in process memory.
+
+    ``credentials_env`` replaces the source environment as the place the
+    three credential names are read from (e.g. values merged from
+    ``credentials_command``); it is never written anywhere.
     """
     client_id_env = _safe_env_name(client_id_env, _DEFAULT_CLIENT_ID_ENV, "client_id_env")
     client_secret_env = _safe_env_name(
@@ -508,7 +584,7 @@ def mint_session(
     master_password_env = _safe_env_name(
         master_password_env, _DEFAULT_MASTER_PASSWORD_ENV, "master_password_env"
     )
-    source_env = get_source_environment()
+    source_env = credentials_env if credentials_env is not None else get_source_environment()
     credentials = {
         client_id_env: str(source_env.get(client_id_env) or "").strip(),
         client_secret_env: str(source_env.get(client_secret_env) or "").strip(),
@@ -962,6 +1038,19 @@ class VaultwardenSource(SecretSource):
                 "description": "Reuse proven in-memory sessions and retry once on expiry in auto-unlock mode; false mints on every fetch",
                 "default": True,
             },
+            "credentials_command": {
+                "description": (
+                    "Auto-unlock only: non-interactive helper run via /bin/sh -c "
+                    "(e.g. secret-tool lookup) printing KEY=VALUE lines for the "
+                    "client ID / client secret / master password names. Fills only "
+                    "names the environment lacks; values stay in memory, never in .env"
+                ),
+                "default": "",
+            },
+            "credentials_command_timeout_seconds": {
+                "description": "Hard timeout for one credentials_command run",
+                "default": _CRED_CMD_TIMEOUT,
+            },
             "client_id_env": {
                 "description": "Env var holding the personal API-key client ID",
                 "default": _DEFAULT_CLIENT_ID_ENV,
@@ -1083,6 +1172,30 @@ class VaultwardenSource(SecretSource):
                 )
                 result.error_kind = ErrorKind.BINARY_MISSING
                 return result
+            credentials_command = str(cfg.get("credentials_command") or "").strip()
+            if credentials_command and not all(credential_values):
+                # Fill only the names the environment does not provide, so an
+                # explicit .env/shell value keeps precedence (Hermes' default).
+                try:
+                    timeout = float(cfg.get("credentials_command_timeout_seconds", _CRED_CMD_TIMEOUT))
+                except (TypeError, ValueError):
+                    timeout = _CRED_CMD_TIMEOUT
+                try:
+                    from_command = run_credentials_command(
+                        credentials_command, credential_names, timeout=timeout
+                    )
+                except RuntimeError as exc:
+                    result.error = str(exc)
+                    result.error_kind = (
+                        ErrorKind.TIMEOUT if "timed out" in str(exc) else ErrorKind.NOT_CONFIGURED
+                    )
+                    return result
+                credential_values = [
+                    value or from_command.get(name, "")
+                    for name, value in zip(credential_names, credential_values)
+                ]
+                sensitive.extend(credential_values)
+            credentials_env = dict(zip(credential_names, credential_values))
             effective = [credential_values[0].strip(), credential_values[1].strip(), credential_values[2]]
             sensitive.extend(effective)
             auth_key = (str(appdata_dir.resolve()), str(Path(binary0).resolve()),
@@ -1094,7 +1207,7 @@ class VaultwardenSource(SecretSource):
                 return mint_session(
                     binary0, home_path=home_path, client_id_env=credential_names[0],
                     client_secret_env=credential_names[1], master_password_env=credential_names[2],
-                    server_url=str(cfg.get("server_url") or ""),
+                    server_url=str(cfg.get("server_url") or ""), credentials_env=credentials_env,
                 )
 
             with _AUTH_LOCK:

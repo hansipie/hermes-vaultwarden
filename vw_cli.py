@@ -488,13 +488,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("Cache TTL (s)",    str(vw_cfg.get("cache_ttl_seconds", 0)))
 
     if auto_unlock:
+        helper = bool(str(vw_cfg.get("credentials_command") or "").strip())
+        table.add_row("credentials_command", _yn(helper))
         for key, default in (
             ("client_id_env", "BW_CLIENTID"),
             ("client_secret_env", "BW_CLIENTSECRET"),
             ("master_password_env", "BW_MASTER_PASSWORD"),
         ):
             env_name = str(vw_cfg.get(key) or default)
-            table.add_row(env_name, "[green]present[/green]" if os.environ.get(env_name) else "[red]missing[/red]")
+            if os.environ.get(env_name):
+                cell = "[green]present[/green]"
+            elif helper:
+                # Not run here: status never resolves credential values.
+                cell = "[dim]from credentials_command at fetch[/dim]"
+            else:
+                cell = "[red]missing[/red]"
+            table.add_row(env_name, cell)
 
     if binary:
         appdata_dir = vw._profile_bw_appdata(get_hermes_home()) if auto_unlock else None
