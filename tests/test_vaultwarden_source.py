@@ -605,23 +605,24 @@ class TestVaultwardenSourceFetch:
         assert self.source.token_env({"session_env": "MY_BW_TOKEN"}) == "MY_BW_TOKEN"
         assert self.source.token_env({"session_env": "not a name"}) == "BW_SESSION"
 
-    def test_session_stripped_from_child_env(self, tmp_path):
-        # Security guarantee: once this source is registered, Hermes strips its
-        # bootstrap token (token_env -> BW_SESSION) from spawned children.
-        # Checked end to end through the public hermes_subprocess_env() in a
-        # fresh interpreter, mirroring startup (plugin registered, then the
-        # spawn policy imported).  Never skipped: if Hermes renames the API or
-        # stops stripping the token, this must fail loudly (issue #11).
+    @staticmethod
+    def _probe_child_env(tmp_path, *, register_first: bool) -> list:
+        """Env names Hermes' public hermes_subprocess_env() keeps, computed in a
+        fresh interpreter where the plugin registers before or after the spawn
+        policy module is imported."""
         import os
         import sys
         import textwrap
 
-        probe = textwrap.dedent("""
-            import json
+        register = textwrap.dedent("""
             from agent.secret_sources import registry
             import vw_source as vw
             registry.register_source(vw.VaultwardenSource())
-            from tools.environments.local import hermes_subprocess_env
+        """)
+        policy = "from tools.environments.local import hermes_subprocess_env\n"
+        probe = "import json\n" + (
+            register + policy if register_first else policy + register
+        ) + textwrap.dedent("""
             base = {"BW_SESSION": "probe-token", "KEEP_ME": "1"}
             print(json.dumps(sorted(hermes_subprocess_env(base_env=base))))
         """)
@@ -638,7 +639,31 @@ class TestVaultwardenSourceFetch:
         assert proc.returncode == 0, proc.stderr[-2000:]
         child_env = json.loads(proc.stdout.strip().splitlines()[-1])
         assert "KEEP_ME" in child_env, "probe is not exercising the real scrub"
-        assert "BW_SESSION" not in child_env
+        return child_env
+
+    def test_session_stripped_from_child_env(self, tmp_path):
+        # Security guarantee: once this source is registered, Hermes strips its
+        # bootstrap token (token_env -> BW_SESSION) from spawned children.
+        # Checked end to end through the public hermes_subprocess_env() in a
+        # fresh interpreter (plugin registered, then the spawn policy imported).
+        # Never skipped: if Hermes renames the API or stops stripping the
+        # token, this must fail loudly (issue #11).
+        assert "BW_SESSION" not in self._probe_child_env(tmp_path, register_first=True)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "hermes-agent freezes _ALWAYS_STRIP_KEYS / _HERMES_PROVIDER_ENV_BLOCKLIST "
+            "when tools.environments.local_env_policy is imported. In real startup "
+            "model_tools imports it before plugin discovery registers this source, "
+            "so BW_SESSION reaches spawned children. Strict: when upstream fixes it "
+            "this XPASSes and fails the suite. Drop the marker then."
+        ),
+    )
+    def test_session_stripped_when_policy_imported_before_plugin(self, tmp_path):
+        # Real startup order (traced on hermes-agent caafe53): model_tools ->
+        # local_env_policy import -> built-in sources -> plugin discovery.
+        assert "BW_SESSION" not in self._probe_child_env(tmp_path, register_first=False)
 
     def test_protected_env_vars_follows_config(self):
         defaults = {
