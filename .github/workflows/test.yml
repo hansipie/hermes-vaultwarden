@@ -1,0 +1,50 @@
+# Reusable test job: runs the plugin's pytest suite against a given
+# hermes-agent revision. The plugin is not packaged; it imports hermes-agent
+# (agent.secret_sources, hermes_cli, ...) and conftest.py locates the
+# checkout through HERMES_AGENT_SRC.
+name: test
+
+on:
+  workflow_call:
+    inputs:
+      hermes_ref:
+        description: hermes-agent commit, tag or branch to test against
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out hermes-agent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.hermes_ref }}
+          path: .hermes-agent
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Install hermes-agent from its lockfile
+        working-directory: .hermes-agent
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
+        run: |
+          uv sync --frozen --no-dev
+          uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" pytest
+
+      - name: Run tests
+        env:
+          HERMES_AGENT_SRC: ${{ github.workspace }}/.hermes-agent
+        run: .venv/bin/python -m pytest -q -rs -p no:cacheprovider tests
